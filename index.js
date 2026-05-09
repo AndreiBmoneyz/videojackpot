@@ -8,7 +8,6 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const https = require('https');
 
 const app = express();
 app.use(express.json());
@@ -43,6 +42,9 @@ function getCreditsForDuration(seconds) {
   return 170;
 }
 
+// Track active FFmpeg processes for cancellation
+const activeExports = new Map(); // userId -> { proc, outputFile, tmpFiles }
+
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY, email TEXT, name TEXT, avatar TEXT,
@@ -54,9 +56,7 @@ pool.query(`
     batch_cooldown_until TIMESTAMP,
     current_streak INTEGER NOT NULL DEFAULT 0,
     watermark_removed_until TIMESTAMP,
-    hd_removed_until TIMESTAMP,
-    youtube_access_token TEXT,
-    youtube_refresh_token TEXT
+    hd_removed_until TIMESTAMP
   )
 `).catch(console.error);
 
@@ -107,10 +107,11 @@ async function checkDailyReset(userId) {
   return user;
 }
 
-app.get('/auth/google', passport.authenticate('google', {
-  scope: ['profile', 'email'],
-}));
+function cleanupFiles(tmpFiles) {
+  tmpFiles.forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(e) {} });
+}
 
+app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 app.get('/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), (req, res) => res.redirect('/'));
 app.get('/logout', (req, res) => { req.logout(() => res.redirect('/login')); });
 
@@ -178,7 +179,8 @@ app.get('/state', requireAuth, async (req, res) => {
       watermarkActive,
       watermarkSecsLeft: !watermarkActive ? Math.ceil((new Date(user.watermark_removed_until) - now) / 1000) : 0,
       hdActive,
-      hdSecsLeft: !hdActive ? Math.ceil((new Date(user.hd_removed_until) - now) / 1000) : 0
+      hdSecsLeft: !hdActive ? Math.ceil((new Date(user.hd_removed_until) - now) / 1000) : 0,
+      isExporting: activeExports.has(req.user.id)
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -235,11 +237,22 @@ app.post('/watch-hd-ad', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post('/cancel-export', requireAuth, async (req, res) => {
+  try {
+    const exportData = activeExports.get(req.user.id);
+    if (!exportData) return res.json({ success: false, message: 'No active export found' });
+    exportData.cancelled = true;
+    try { exportData.proc.kill('SIGKILL'); } catch(e) {}
+    cleanupFiles(exportData.tmpFiles);
+    activeExports.delete(req.user.id);
+    res.json({ success: true, message: 'Export cancelled. Credits are non-refundable.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 20 }]), async (req, res) => {
   const tmpFiles = [];
   try {
-    const { fps = 1, repeatCount = 1, durationSeconds, fadeIn = 'false', fadeOut = 'false',
-            fitMode = 'original', ytTitle, ytDesc, ytVisibility = 'public', ytCategory = '10', ytKids = 'false' } = req.body;
+    const { fps = 1, repeatCount = 1, durationSeconds, fadeIn = 'false', fadeOut = 'false', fitMode = 'original' } = req.body;
 
     const durSecs = Math.min(parseInt(durationSeconds) || 3600, 43200);
     const doFadeIn = fadeIn === 'true';
@@ -251,11 +264,15 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
     const user = (await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id])).rows[0];
     if (user.credits < totalCost) return res.status(400).json({ error: `Not enough credits. Need ${totalCost}, have ${user.credits}` });
     if (!req.files.image || !req.files.audio) return res.status(400).json({ error: 'Image and audio required' });
+    if (activeExports.has(req.user.id)) return res.status(400).json({ error: 'You already have an export in progress' });
 
     const imageFile = req.files.image[0];
     const audioFiles = req.files.audio;
     tmpFiles.push(imageFile.path);
     audioFiles.forEach(f => tmpFiles.push(f.path));
+
+    // Deduct credits immediately — non-refundable
+    await pool.query('UPDATE users SET credits = credits - $1 WHERE id = $2', [totalCost, req.user.id]);
 
     const now = new Date();
     const watermarkActive = !user.watermark_removed_until || new Date(user.watermark_removed_until) <= now;
@@ -263,6 +280,7 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
     const width = hdActive ? 1280 : 1920;
     const height = hdActive ? 720 : 1080;
 
+    // Process image fit
     const processedImage = path.join(os.tmpdir(), `proc_${Date.now()}.jpg`);
     tmpFiles.push(processedImage);
 
@@ -282,11 +300,9 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
     } else {
       scaleFilter = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`;
     }
+    if (scaleFilter) await runFFmpeg(['-i', imageFile.path, '-vf', scaleFilter, '-y', processedImage]);
 
-    if (scaleFilter) {
-      await runFFmpeg(['-i', imageFile.path, '-vf', scaleFilter, '-y', processedImage]);
-    }
-
+    // Apply watermark
     let finalImagePath = processedImage;
     if (watermarkActive) {
       const wmPath = path.join(os.tmpdir(), `wm_${Date.now()}.jpg`);
@@ -297,6 +313,7 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
       finalImagePath = wmPath;
     }
 
+    // Concat audio
     const concatPath = path.join(os.tmpdir(), `concat_${Date.now()}.txt`);
     tmpFiles.push(concatPath);
     let concatContent = '';
@@ -307,35 +324,58 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
 
     const mergedAudio = path.join(os.tmpdir(), `merged_${Date.now()}.aac`);
     tmpFiles.push(mergedAudio);
-    await runFFmpeg(['-f', 'concat', '-safe', '0', '-i', concatPath, '-c:a', 'aac', '-b:a', '192k', mergedAudio]);
+    await runFFmpeg(['-f', 'concat', '-safe', '0', '-i', concatPath, '-c:a', 'aac', '-b:a', '192k', '-vn', mergedAudio]);
 
     const outputFile = path.join(os.tmpdir(), `output_${Date.now()}.mp4`);
     tmpFiles.push(outputFile);
-    const fpsVal = Math.min(Math.max(parseInt(fps) || 1, 1), 30);
+    const fpsVal = doFadeIn || doFadeOut ? 24 : 1;
 
     let vf = 'format=yuv420p';
     if (doFadeIn) vf += ',fade=t=in:st=0:d=3';
     if (doFadeOut) vf += `,fade=t=out:st=${durSecs - 3}:d=3`;
 
-    await runFFmpeg([
+    // Start the main FFmpeg process
+    const ffmpegArgs = [
       '-loop', '1', '-framerate', String(fpsVal), '-i', finalImagePath,
       '-i', mergedAudio,
-      '-c:v', 'libx264', '-tune', 'stillimage',
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-tune', 'stillimage',
       '-vf', vf,
       '-c:a', 'aac', '-b:a', '192k',
       '-t', String(durSecs),
       '-movflags', '+faststart', '-y', outputFile
-    ]);
+    ];
 
-    await pool.query('UPDATE users SET credits = credits - $1 WHERE id = $2', [totalCost, req.user.id]);
+    const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
+    const exportData = { proc: ffmpegProc, outputFile, tmpFiles, cancelled: false };
+    activeExports.set(req.user.id, exportData);
 
-    res.download(outputFile, (ytTitle || 'loopmixvideo') + '.mp4', () => {
-      tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch(e) {} });
+    await new Promise((resolve, reject) => {
+      let stderr = '';
+      ffmpegProc.stderr.on('data', d => stderr += d.toString());
+      ffmpegProc.on('close', code => {
+        if (exportData.cancelled) { reject(new Error('CANCELLED')); return; }
+        if (code === 0) resolve();
+        else reject(new Error('FFmpeg: ' + stderr.slice(-500)));
+      });
+    });
+
+    activeExports.delete(req.user.id);
+
+    // Send file, then delete after 30 seconds
+    res.download(outputFile, (req.body.fileName || 'loopmixvideo') + '.mp4', (err) => {
+      setTimeout(() => cleanupFiles(tmpFiles), 30000);
     });
 
   } catch (e) {
-    tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch(e) {} });
-    res.status(500).json({ error: e.message });
+    activeExports.delete(req.user.id);
+    cleanupFiles(tmpFiles);
+    if (e.message === 'CANCELLED') {
+      res.status(499).json({ error: 'Export was cancelled' });
+    } else {
+      res.status(500).json({ error: e.message });
+    }
   }
 });
 
@@ -383,8 +423,8 @@ app.get('/', requireAuth, async (req, res) => {
   .yt-meta { margin-top: 10px; }
   .yt-title-preview { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .yt-channel { font-size: 13px; color: #888; margin-bottom: 6px; }
-  .yt-stats { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #777; }
-  .yt-likes { display: flex; align-items: center; gap: 5px; background: #222; border-radius: 99px; padding: 4px 12px; font-size: 13px; }
+  .yt-stats { display: flex; align-items: center; gap: 12px; }
+  .yt-likes { display: flex; align-items: center; gap: 5px; background: #222; border-radius: 99px; padding: 4px 12px; font-size: 13px; color: #777; }
   .fit-options { display: flex; flex-direction: column; gap: 8px; }
   .fit-option { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; border: 1.5px solid #2a2a2a; cursor: pointer; transition: all 0.15s; background: transparent; }
   .fit-option:hover { border-color: #fbbf24; }
@@ -430,44 +470,14 @@ app.get('/', requireAuth, async (req, res) => {
   .credit-row:last-child { margin-bottom: 0; padding-top: 10px; border-top: 1px solid #222; font-size: 17px; font-weight: 700; color: #fff; }
   .credit-row .val { color: #fbbf24; font-weight: 600; }
   .not-enough-btn { background: #f87171; color: #0f0f0f; border: none; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 700; cursor: pointer; margin-left: 8px; }
-  .yt-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; background: transparent; border: none; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; padding: 0; }
-  .yt-arrow { color: #555; transition: transform 0.2s; }
-  .yt-toggle.open .yt-arrow { transform: rotate(180deg); }
-  .yt-body { display: none; margin-top: 16px; padding-top: 16px; border-top: 1px solid #222; }
-  .yt-body.open { display: block; }
-  .yt-field { margin-bottom: 14px; }
-  .yt-field label { font-size: 13px; color: #666; display: block; margin-bottom: 7px; }
-  .yt-field input, .yt-field textarea, .yt-field select { width: 100%; padding: 10px 14px; background: #111; border: 1px solid #2a2a2a; border-radius: 8px; color: #fff; font-size: 14px; outline: none; transition: border-color 0.15s; font-family: inherit; resize: vertical; }
-  .yt-field input:focus, .yt-field textarea:focus, .yt-field select:focus { border-color: #fbbf24; }
-  .yt-field select option { background: #1a1a1a; }
-  .yt-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid #1a1a1a; }
-  .toggle-row label { font-size: 14px; color: #aaa; }
-  .toggle { position: relative; width: 44px; height: 24px; }
-  .toggle input { opacity: 0; width: 0; height: 0; }
-  .toggle-slider { position: absolute; inset: 0; background: #2a2a2a; border-radius: 99px; cursor: pointer; transition: background 0.2s; }
-  .toggle-slider:before { content: ''; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: #555; border-radius: 50%; transition: all 0.2s; }
-  .toggle input:checked + .toggle-slider { background: rgba(251,191,36,0.2); }
-  .toggle input:checked + .toggle-slider:before { transform: translateX(20px); background: #fbbf24; }
-  .export-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-  .export-option { border: 2px solid #2a2a2a; border-radius: 12px; padding: 16px; text-align: center; background: transparent; position: relative; }
-  .export-option.clickable { cursor: pointer; transition: all 0.15s; }
-  .export-option.clickable:hover { border-color: #fbbf24; }
-  .export-option.selected { border-color: #fbbf24; background: rgba(251,191,36,0.08); }
-  .export-option.disabled { opacity: 0.45; cursor: not-allowed; }
-  .export-option .check { position: absolute; top: 10px; right: 10px; width: 22px; height: 22px; border-radius: 50%; border: 2px solid #333; display: flex; align-items: center; justify-content: center; font-size: 12px; transition: all 0.15s; }
-  .export-option.selected .check { background: #fbbf24; border-color: #fbbf24; color: #0f0f0f; }
-  .export-option .icon { font-size: 28px; margin-bottom: 8px; display: block; }
-  .export-option .label { font-size: 15px; font-weight: 700; color: #fff; margin-bottom: 4px; }
-  .export-option .sublabel { font-size: 12px; color: #555; }
-  .export-option .wm-note { font-size: 12px; color: #f87171; margin-top: 4px; }
-  .export-option .wm-note.clear { color: #4ade80; }
-  .coming-soon-badge { display: inline-block; background: rgba(251,191,36,0.15); color: #fbbf24; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 99px; margin-top: 6px; }
   .go-btn { width: 100%; padding: 17px; font-size: 17px; font-weight: 800; border-radius: 12px; border: none; background: #fbbf24; color: #0f0f0f; cursor: pointer; transition: opacity 0.15s; }
   .go-btn:hover:not(:disabled) { opacity: 0.9; }
   .go-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .cancel-btn { width: 100%; padding: 13px; font-size: 15px; font-weight: 700; border-radius: 12px; border: 1.5px solid #f87171; background: transparent; color: #f87171; cursor: pointer; transition: all 0.15s; margin-top: 8px; display: none; }
+  .cancel-btn:hover { background: rgba(248,113,113,0.1); }
   .export-status { background: #111; border: 1px solid #222; border-radius: 10px; padding: 16px; margin-top: 12px; font-size: 14px; color: #777; display: none; }
   .export-status.active { display: block; }
+  .export-note { font-size: 12px; color: #555; margin-top: 8px; }
   .progress-track { height: 4px; background: #222; border-radius: 99px; overflow: hidden; margin-top: 12px; }
   .progress-fill { height: 100%; background: #fbbf24; border-radius: 99px; width: 0%; transition: width 0.5s; }
   .result-box { margin-top: 12px; padding: 14px; background: #0f1a0f; border: 1px solid #166534; border-radius: 10px; color: #4ade80; font-size: 14px; display: none; }
@@ -535,7 +545,7 @@ app.get('/', requireAuth, async (req, res) => {
     <div class="image-section">
       <div>
         <div class="yt-preview-label">Your Video Preview</div>
-        <div class="yt-thumbnail" id="yt-thumb">
+        <div class="yt-thumbnail">
           <div class="upload-placeholder" id="upload-placeholder">
             <input type="file" id="img-input" accept="image/*" onchange="handleImage(event)" />
             <span class="upload-icon-big">🖼</span>
@@ -630,64 +640,10 @@ app.get('/', requireAuth, async (req, res) => {
   </div>
 
   <div class="card">
-    <button class="yt-toggle" id="yt-settings-toggle" onclick="toggleYT()">
-      <span>📺 Video Settings</span>
-      <span class="yt-arrow">▼</span>
-    </button>
-    <div class="yt-body" id="yt-body">
-      <div class="yt-field" style="margin-top:0">
-        <label>Video title</label>
-        <input type="text" id="yt-title" placeholder="My Lofi Mix 2026" oninput="document.getElementById('yt-title-preview').textContent=this.value||'Your Video Title'" />
-      </div>
-      <div class="yt-field">
-        <label>Description</label>
-        <textarea id="yt-desc" rows="3" placeholder="Relaxing lofi music for studying..."></textarea>
-      </div>
-      <div class="yt-row">
-        <div class="yt-field">
-          <label>Visibility (for when YouTube upload launches)</label>
-          <select id="yt-visibility">
-            <option value="public">Public</option>
-            <option value="unlisted">Unlisted</option>
-            <option value="private">Private</option>
-          </select>
-        </div>
-        <div class="yt-field">
-          <label>Category</label>
-          <select id="yt-category">
-            <option value="10">Music</option>
-            <option value="22">People &amp; Blogs</option>
-            <option value="24">Entertainment</option>
-            <option value="27">Education</option>
-          </select>
-        </div>
-      </div>
-      <div class="toggle-row">
-        <label>Made for kids</label>
-        <label class="toggle"><input type="checkbox" id="yt-kids" /><span class="toggle-slider"></span></label>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="section-label">Export Options</div>
-    <div class="export-btns">
-      <div class="export-option clickable selected" id="opt-download" onclick="toggleExportOpt('download')">
-        <div class="check">✓</div>
-        <span class="icon">⬇️</span>
-        <div class="label">Download MP4</div>
-        <div class="sublabel">Save to your computer</div>
-        <div class="wm-note" id="dl-wm-note">with watermark</div>
-      </div>
-      <div class="export-option disabled" id="opt-youtube">
-        <div class="check"></div>
-        <span class="icon">▶️</span>
-        <div class="label">Upload to YouTube</div>
-        <div class="sublabel">Direct to your channel</div>
-        <div class="coming-soon-badge">Coming soon</div>
-      </div>
-    </div>
+    <div class="section-label">Export</div>
+    <div style="font-size:13px;color:#555;margin-bottom:12px;">⚠️ Credits are deducted immediately when export starts and are non-refundable if cancelled. Your video will auto-download when ready and be deleted from our servers within 30 seconds.</div>
     <button class="go-btn" id="go-btn" onclick="startExport()">Export &amp; Download MP4</button>
+    <button class="cancel-btn" id="cancel-btn" onclick="cancelExport()">✕ Cancel Export (credits non-refundable)</button>
     <div class="export-status" id="export-status">
       <div id="export-msg">Preparing...</div>
       <div class="progress-track"><div class="progress-fill" id="export-progress"></div></div>
@@ -707,8 +663,8 @@ let audioFiles = [], audioDurations = [];
 let fadeInActive = false, fadeOutActive = false;
 let isImageFile = false;
 let fitMode = 'original';
-let exportDL = true;
 let uploadedImage = null;
+let isExporting = false;
 const TIERS = [0,10,25,45,75,125,190];
 const COLORS = ['#f87171','#fb923c','#facc15','#fbbf24','#34d399','#22d3ee','#818cf8'];
 const DURATION_CREDITS = [
@@ -769,14 +725,6 @@ function updateCreditCost() {
     totalEl.innerHTML = total+' credits <button class="not-enough-btn" onclick="openAdModal()">Not enough — watch ads</button>';
   } else {
     totalEl.textContent = total+' credits';
-  }
-}
-
-function toggleExportOpt(type) {
-  if (type==='download') {
-    exportDL=!exportDL;
-    document.getElementById('opt-download').classList.toggle('selected',exportDL);
-    document.getElementById('opt-download').querySelector('.check').textContent=exportDL?'✓':'';
   }
 }
 
@@ -869,8 +817,6 @@ function renderTrackList() {
   });
 }
 
-function toggleYT() { document.getElementById('yt-settings-toggle').classList.toggle('open'); document.getElementById('yt-body').classList.toggle('open'); }
-
 async function watchWatermarkAd() {
   const btn=document.getElementById('wm-btn'); btn.textContent='⏳ Ad playing...'; btn.disabled=true;
   await new Promise(r=>setTimeout(r,2000));
@@ -891,14 +837,11 @@ function updateBadges() {
   if (!state) return;
   const wmBadge=document.getElementById('wm-badge'), wmText=document.getElementById('wm-text'), wmBtn=document.getElementById('wm-btn');
   const hdBadge=document.getElementById('hd-badge'), hdText=document.getElementById('hd-text'), hdBtn=document.getElementById('hd-btn');
-  const wmNote=document.getElementById('dl-wm-note');
   if (state.watermarkActive) {
     wmBadge.className='badge wm-active'; wmText.textContent='⚠️ Watermark active'; wmBtn.style.display=''; wmBtn.textContent='Watch 1 ad to remove'; wmBtn.disabled=false;
-    wmNote.textContent='with watermark'; wmNote.className='wm-note';
   } else {
     const h=Math.floor(state.watermarkSecsLeft/3600), m=Math.floor((state.watermarkSecsLeft%3600)/60);
     wmBadge.className='badge wm-removed'; wmText.textContent='✓ No watermark — '+(h>0?h+'h ':'')+m+'m left'; wmBtn.style.display='none';
-    wmNote.textContent=''; wmNote.className='wm-note clear';
   }
   if (state.hdActive) {
     hdBadge.className='badge hd-active'; hdText.textContent='📺 720p — Free'; hdBtn.textContent='1080p for 24hrs — Watch 1 ad'; hdBtn.disabled=false; hdBtn.style.display='';
@@ -964,23 +907,40 @@ async function fetchState() {
   updateBadges(); updateCreditCost();
 }
 
+async function cancelExport() {
+  const res = await fetch('/cancel-export', {method:'POST'});
+  const data = await res.json();
+  document.getElementById('export-msg').textContent = '✕ Export cancelled — credits were not refunded';
+  document.getElementById('export-progress').style.width = '0%';
+  document.getElementById('cancel-btn').style.display = 'none';
+  document.getElementById('go-btn').disabled = false;
+  isExporting = false;
+  await fetchState();
+}
+
 async function startExport() {
   if (!document.getElementById('img-input').files[0]) { alert('Please select a background image'); return; }
   if (audioFiles.length===0) { alert('Please add at least one audio track'); return; }
-  if (!exportDL) { alert('Please select Download MP4'); return; }
   const secs=parseDur(document.getElementById('dur-input').value);
   const total=getCreditsForSecs(secs)+(fadeInActive?5:0)+(fadeOutActive?5:0);
   if (!state||state.credits<total){openAdModal();return;}
 
   const btn=document.getElementById('go-btn');
+  const cancelBtn=document.getElementById('cancel-btn');
   const status=document.getElementById('export-status');
   const msg=document.getElementById('export-msg');
   const progress=document.getElementById('export-progress');
   const resultBox=document.getElementById('result-box');
   const errorBox=document.getElementById('error-box');
 
-  btn.disabled=true; status.classList.add('active'); resultBox.style.display='none'; errorBox.style.display='none';
-  msg.textContent='Uploading files to server...'; progress.style.width='8%';
+  btn.disabled=true;
+  cancelBtn.style.display='block';
+  status.classList.add('active');
+  resultBox.style.display='none';
+  errorBox.style.display='none';
+  isExporting=true;
+  msg.textContent='Uploading files to server...';
+  progress.style.width='8%';
 
   const formData=new FormData();
   formData.append('image',document.getElementById('img-input').files[0]);
@@ -991,34 +951,47 @@ async function startExport() {
   formData.append('fadeIn',fadeInActive);
   formData.append('fadeOut',fadeOutActive);
   formData.append('fitMode',fitMode);
-  formData.append('ytTitle',document.getElementById('yt-title').value||'My Music Mix');
-  formData.append('ytDesc',document.getElementById('yt-desc').value||'');
-  formData.append('ytVisibility',document.getElementById('yt-visibility').value);
-  formData.append('ytCategory',document.getElementById('yt-category').value);
-  formData.append('ytKids',document.getElementById('yt-kids').checked);
+  formData.append('fileName', document.getElementById('yt-title-preview').textContent || 'loopmixvideo');
 
-  msg.textContent='Encoding video...'; progress.style.width='20%';
-  let prog=20; const iv=setInterval(()=>{if(prog<85){prog++;progress.style.width=prog+'%';}},5000);
+  msg.textContent='Encoding video — this may take a few minutes...';
+  progress.style.width='20%';
+  let prog=20;
+  const iv=setInterval(()=>{if(prog<85){prog++;progress.style.width=prog+'%';}},5000);
 
   try {
     const res=await fetch('/export',{method:'POST',body:formData});
-    clearInterval(iv); progress.style.width='95%';
-    if (!res.ok) { const e=await res.json(); throw new Error(e.error||'Export failed'); }
+    clearInterval(iv);
+    if (!res.ok) {
+      const e=await res.json();
+      throw new Error(e.error||'Export failed');
+    }
+    progress.style.width='95%';
+    msg.textContent='✓ Done! Downloading your video...';
     const blob=await res.blob();
     const url=URL.createObjectURL(blob);
-    const a=document.createElement('a'); a.href=url;
-    a.download=(document.getElementById('yt-title').value||'loopmixvideo')+'.mp4';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download=(document.getElementById('yt-title-preview').textContent||'loopmixvideo')+'.mp4';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
     progress.style.width='100%';
-    resultBox.innerHTML='✓ Video downloaded successfully!'; resultBox.style.display='block';
     msg.textContent='✓ Complete!';
+    resultBox.innerHTML='✓ Video downloaded! File will be deleted from our servers within 30 seconds.';
+    resultBox.style.display='block';
     await fetchState();
   } catch(e) {
     clearInterval(iv);
-    document.getElementById('error-msg').textContent='Error: '+e.message;
-    errorBox.style.display='block';
-    msg.textContent='Failed'; progress.style.width='0%';
-  } finally { btn.disabled=false; }
+    if (e.message !== 'Export was cancelled') {
+      document.getElementById('error-msg').textContent='Error: '+e.message;
+      errorBox.style.display='block';
+    }
+    msg.textContent='Failed';
+    progress.style.width='0%';
+  } finally {
+    btn.disabled=false;
+    cancelBtn.style.display='none';
+    isExporting=false;
+  }
 }
 
 fetchState();
