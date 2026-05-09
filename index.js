@@ -74,11 +74,8 @@ passport.use(new GoogleStrategy({
   try {
     const existing = await pool.query('SELECT * FROM users WHERE id = $1', [profile.id]);
     if (existing.rows.length === 0) {
-      await pool.query('INSERT INTO users (id, email, name, avatar, youtube_access_token, youtube_refresh_token) VALUES ($1, $2, $3, $4, $5, $6)',
-        [profile.id, profile.emails[0].value, profile.displayName, profile.photos[0].value, accessToken, refreshToken || null]);
-    } else {
-      await pool.query('UPDATE users SET youtube_access_token = $1, youtube_refresh_token = $2 WHERE id = $3',
-        [accessToken, refreshToken || null, profile.id]);
+      await pool.query('INSERT INTO users (id, email, name, avatar) VALUES ($1, $2, $3, $4)',
+        [profile.id, profile.emails[0].value, profile.displayName, profile.photos[0].value]);
     }
     const user = await pool.query('SELECT * FROM users WHERE id = $1', [profile.id]);
     return done(null, user.rows[0]);
@@ -110,11 +107,8 @@ async function checkDailyReset(userId) {
   return user;
 }
 
-// Update Google OAuth scope to include YouTube
 app.get('/auth/google', passport.authenticate('google', {
-  scope: ['profile', 'email', 'https://www.googleapis.com/auth/youtube.upload'],
-  accessType: 'offline',
-  prompt: 'consent'
+  scope: ['profile', 'email'],
 }));
 
 app.get('/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), (req, res) => res.redirect('/'));
@@ -140,7 +134,6 @@ app.get('/login', (req, res) => {
   .feature strong { display: block; color: #fbbf24; font-size: 14px; margin-bottom: 3px; }
   .btn-google { display: flex; align-items: center; justify-content: center; gap: 12px; width: 100%; padding: 15px; background: #fff; color: #000; font-size: 16px; font-weight: 700; border-radius: 12px; border: none; cursor: pointer; text-decoration: none; transition: opacity 0.15s; }
   .btn-google:hover { opacity: 0.9; }
-  .note { font-size: 12px; color: #444; margin-top: 12px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -152,13 +145,12 @@ app.get('/login', (req, res) => {
     <div class="feature"><strong>Up to 12 hours</strong>Long music mixes</div>
     <div class="feature"><strong>Free exports</strong>Watch ads for credits</div>
     <div class="feature"><strong>No watermark</strong>Watch 1 ad to remove</div>
-    <div class="feature"><strong>Direct upload</strong>Straight to YouTube</div>
+    <div class="feature"><strong>MP4 download</strong>Ready for YouTube</div>
   </div>
   <a href="/auth/google" class="btn-google">
     <img src="https://www.google.com/favicon.ico" width="20" height="20" alt="G" />
     Sign in with Google
   </a>
-  <p class="note">We'll ask permission to upload videos to your YouTube channel.<br>We never access your existing videos or personal data.</p>
 </div>
 </body>
 </html>`);
@@ -243,81 +235,11 @@ app.post('/watch-hd-ad', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-async function uploadToYouTube(accessToken, videoPath, title, description, privacyStatus, categoryId, madeForKids) {
-  return new Promise((resolve, reject) => {
-    const videoStats = fs.statSync(videoPath);
-    const videoSize = videoStats.size;
-    const metadata = JSON.stringify({
-      snippet: { title: title || 'My Music Mix', description: description || '', categoryId: categoryId || '10' },
-      status: { privacyStatus: privacyStatus || 'public', madeForKids: madeForKids === 'true' }
-    });
-
-    // Initiate resumable upload
-    const initOptions = {
-      hostname: 'www.googleapis.com',
-      path: '/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + accessToken,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(metadata),
-        'X-Upload-Content-Type': 'video/mp4',
-        'X-Upload-Content-Length': videoSize
-      }
-    };
-
-    const initReq = https.request(initOptions, (initRes) => {
-      if (initRes.statusCode !== 200) {
-        let body = '';
-        initRes.on('data', d => body += d);
-        initRes.on('end', () => reject(new Error('YouTube init failed: ' + body)));
-        return;
-      }
-      const uploadUrl = initRes.headers.location;
-      if (!uploadUrl) { reject(new Error('No upload URL returned')); return; }
-
-      // Upload the video
-      const urlObj = new URL(uploadUrl);
-      const uploadOptions = {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'video/mp4',
-          'Content-Length': videoSize
-        }
-      };
-
-      const uploadReq = https.request(uploadOptions, (uploadRes) => {
-        let body = '';
-        uploadRes.on('data', d => body += d);
-        uploadRes.on('end', () => {
-          if (uploadRes.statusCode === 200 || uploadRes.statusCode === 201) {
-            try { resolve(JSON.parse(body)); }
-            catch(e) { resolve({ id: 'unknown' }); }
-          } else {
-            reject(new Error('YouTube upload failed: ' + body));
-          }
-        });
-      });
-
-      uploadReq.on('error', reject);
-      const stream = fs.createReadStream(videoPath);
-      stream.pipe(uploadReq);
-    });
-
-    initReq.on('error', reject);
-    initReq.write(metadata);
-    initReq.end();
-  });
-}
-
 app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 20 }]), async (req, res) => {
   const tmpFiles = [];
   try {
     const { fps = 1, repeatCount = 1, durationSeconds, fadeIn = 'false', fadeOut = 'false',
-            fitMode = 'original', uploadYT = 'false', downloadFile = 'false',
-            ytTitle, ytDesc, ytVisibility = 'public', ytCategory = '10', ytKids = 'false' } = req.body;
+            fitMode = 'original', ytTitle, ytDesc, ytVisibility = 'public', ytCategory = '10', ytKids = 'false' } = req.body;
 
     const durSecs = Math.min(parseInt(durationSeconds) || 3600, 43200);
     const doFadeIn = fadeIn === 'true';
@@ -338,11 +260,9 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
     const now = new Date();
     const watermarkActive = !user.watermark_removed_until || new Date(user.watermark_removed_until) <= now;
     const hdActive = !user.hd_removed_until || new Date(user.hd_removed_until) <= now;
-    const resolution = hdActive ? '1280x720' : '1920x1080';
     const width = hdActive ? 1280 : 1920;
     const height = hdActive ? 720 : 1080;
 
-    // Process image based on fit mode
     const processedImage = path.join(os.tmpdir(), `proc_${Date.now()}.jpg`);
     tmpFiles.push(processedImage);
 
@@ -352,17 +272,14 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
     } else if (fitMode === 'stretch') {
       scaleFilter = `scale=${width}:${height}`;
     } else if (fitMode === 'blur') {
-      // Blur background with original centered
       const blurredBg = path.join(os.tmpdir(), `blur_${Date.now()}.jpg`);
       tmpFiles.push(blurredBg);
       await runFFmpeg(['-i', imageFile.path, '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=20`, '-y', blurredBg]);
       await runFFmpeg(['-i', blurredBg, '-i', imageFile.path,
         '-filter_complex', `[1:v]scale=${width}:${height}:force_original_aspect_ratio=decrease[fg];[0:v][fg]overlay=(W-w)/2:(H-h)/2`,
         '-y', processedImage]);
-      // Skip the normal scale
       scaleFilter = null;
     } else {
-      // Original - pad with black bars
       scaleFilter = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`;
     }
 
@@ -370,7 +287,6 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
       await runFFmpeg(['-i', imageFile.path, '-vf', scaleFilter, '-y', processedImage]);
     }
 
-    // Apply watermark if needed
     let finalImagePath = processedImage;
     if (watermarkActive) {
       const wmPath = path.join(os.tmpdir(), `wm_${Date.now()}.jpg`);
@@ -381,7 +297,6 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
       finalImagePath = wmPath;
     }
 
-    // Concat audio
     const concatPath = path.join(os.tmpdir(), `concat_${Date.now()}.txt`);
     tmpFiles.push(concatPath);
     let concatContent = '';
@@ -414,35 +329,9 @@ app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, 
 
     await pool.query('UPDATE users SET credits = credits - $1 WHERE id = $2', [totalCost, req.user.id]);
 
-    const results = { ytUrl: null, downloaded: false, errors: [] };
-
-    // Upload to YouTube if requested
-    if (uploadYT === 'true') {
-      try {
-        const ytResult = await uploadToYouTube(
-          user.youtube_access_token,
-          outputFile,
-          ytTitle, ytDesc, ytVisibility, ytCategory, ytKids
-        );
-        results.ytUrl = `https://www.youtube.com/watch?v=${ytResult.id}`;
-      } catch (e) {
-        results.errors.push('YouTube upload failed: ' + e.message);
-      }
-    }
-
-    // Download if requested
-    if (downloadFile === 'true') {
-      res.setHeader('X-YT-URL', results.ytUrl || '');
-      res.setHeader('X-YT-Errors', results.errors.join('|'));
-      res.download(outputFile, (ytTitle || 'loopmixvideo') + '.mp4', () => {
-        tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch(e) {} });
-      });
-      return;
-    }
-
-    // YouTube only
-    tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch(e) {} });
-    res.json(results);
+    res.download(outputFile, (ytTitle || 'loopmixvideo') + '.mp4', () => {
+      tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch(e) {} });
+    });
 
   } catch (e) {
     tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch(e) {} });
@@ -469,7 +358,6 @@ app.get('/', requireAuth, async (req, res) => {
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #fff; min-height: 100vh; padding-top: 64px; }
-
   .topbar { position: fixed; top: 0; left: 0; right: 0; background: #111; border-bottom: 1px solid #222; padding: 0 24px; height: 64px; display: flex; align-items: center; justify-content: space-between; z-index: 100; }
   .topbar-logo { font-size: 22px; font-weight: 800; letter-spacing: -0.5px; }
   .topbar-logo span { color: #fbbf24; }
@@ -482,37 +370,29 @@ app.get('/', requireAuth, async (req, res) => {
   .user-avatar { width: 32px; height: 32px; border-radius: 50%; }
   .logout { font-size: 13px; color: #555; text-decoration: none; }
   .logout:hover { color: #f87171; }
-
   .main { max-width: 900px; margin: 0 auto; padding: 2rem 1rem 5rem; }
   .card { background: #1a1a1a; border: 1px solid #222; border-radius: 14px; padding: 1.5rem; margin-bottom: 12px; }
   .section-label { font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #555; margin-bottom: 14px; }
-
-  /* IMAGE SECTION */
   .image-section { display: grid; grid-template-columns: 1fr 220px; gap: 16px; align-items: start; }
-  .yt-preview-wrap { position: relative; }
   .yt-preview-label { font-size: 13px; color: #666; margin-bottom: 8px; }
   .yt-thumbnail { width: 100%; aspect-ratio: 16/9; border-radius: 10px; overflow: hidden; background: #000; position: relative; }
   .yt-thumbnail canvas { width: 100%; height: 100%; display: block; }
-  .yt-thumbnail .upload-placeholder { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #333; font-size: 14px; gap: 8px; cursor: pointer; position: relative; }
-  .yt-thumbnail .upload-placeholder input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
-  .yt-thumbnail .upload-placeholder .upload-icon-big { font-size: 36px; color: #fbbf24; }
+  .upload-placeholder { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #333; font-size: 14px; gap: 8px; cursor: pointer; position: relative; aspect-ratio: 16/9; }
+  .upload-placeholder input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .upload-icon-big { font-size: 36px; color: #fbbf24; }
   .yt-meta { margin-top: 10px; }
-  .yt-meta .yt-title-preview { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .yt-meta .yt-channel { font-size: 13px; color: #888; margin-bottom: 6px; }
-  .yt-meta .yt-stats { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #777; }
-  .yt-meta .yt-likes { display: flex; align-items: center; gap: 5px; background: #222; border-radius: 99px; padding: 4px 12px; font-size: 13px; }
-
-  /* FIT OPTIONS */
+  .yt-title-preview { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .yt-channel { font-size: 13px; color: #888; margin-bottom: 6px; }
+  .yt-stats { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #777; }
+  .yt-likes { display: flex; align-items: center; gap: 5px; background: #222; border-radius: 99px; padding: 4px 12px; font-size: 13px; }
   .fit-options { display: flex; flex-direction: column; gap: 8px; }
   .fit-option { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; border: 1.5px solid #2a2a2a; cursor: pointer; transition: all 0.15s; background: transparent; }
   .fit-option:hover { border-color: #fbbf24; }
   .fit-option.active { border-color: #fbbf24; background: rgba(251,191,36,0.08); }
-  .fit-thumb { width: 52px; height: 30px; border-radius: 4px; overflow: hidden; background: #000; flex-shrink: 0; position: relative; }
+  .fit-thumb { width: 52px; height: 30px; border-radius: 4px; overflow: hidden; background: #000; flex-shrink: 0; }
   .fit-thumb canvas { width: 100%; height: 100%; display: block; }
   .fit-label { font-size: 13px; color: #aaa; line-height: 1.3; }
   .fit-option.active .fit-label { color: #fbbf24; }
-
-  /* WATERMARK + RESOLUTION BADGES */
   .badge-row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
   .badge { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 10px; font-size: 13px; font-weight: 500; flex: 1; min-width: 200px; }
   .badge.wm-active { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: #f87171; }
@@ -523,8 +403,6 @@ app.get('/', requireAuth, async (req, res) => {
   .badge-btn:hover:not(:disabled) { opacity: 0.85; }
   .badge-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .badge-btn.danger { background: #f87171; }
-
-  /* AUDIO */
   .track-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
   .track-item { display: flex; align-items: center; gap: 12px; background: #222; border: 1px solid #333; border-radius: 10px; padding: 12px 16px; }
   .track-icon { color: #fbbf24; font-size: 18px; flex-shrink: 0; }
@@ -535,31 +413,23 @@ app.get('/', requireAuth, async (req, res) => {
   .add-track { width: 100%; padding: 13px; background: transparent; border: 1.5px dashed #333; border-radius: 10px; color: #666; font-size: 15px; cursor: pointer; position: relative; transition: all 0.15s; font-weight: 500; }
   .add-track:hover { border-color: #fbbf24; color: #fbbf24; }
   .add-track input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
-
-  /* FPS */
   .slider-input-row { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
   .slider-input-row label { font-size: 14px; color: #777; width: 130px; flex-shrink: 0; }
   .slider-input-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 99px; background: #2a2a2a; outline: none; cursor: pointer; }
   .slider-input-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #fbbf24; cursor: pointer; }
   .slider-input-row input[type=text], .slider-input-row input[type=number] { width: 90px; padding: 9px 10px; background: #111; border: 1px solid #2a2a2a; border-radius: 8px; color: #fff; font-size: 15px; font-weight: 600; text-align: center; outline: none; transition: border-color 0.15s; flex-shrink: 0; }
   .slider-input-row input:focus { border-color: #fbbf24; }
-
-  /* FADE */
   .fade-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
   .fade-btn { padding: 14px; border-radius: 10px; border: 1.5px solid #2a2a2a; background: transparent; color: #777; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; text-align: center; }
   .fade-btn .cost { font-size: 12px; color: #555; margin-top: 4px; }
   .fade-btn:hover { border-color: #fbbf24; color: #fbbf24; }
   .fade-btn.active { background: rgba(251,191,36,0.1); border-color: #fbbf24; color: #fbbf24; }
   .fade-btn.active .cost { color: #999; }
-
-  /* CREDIT COST */
   .credit-cost-box { background: #111; border: 1px solid #2a2a2a; border-radius: 10px; padding: 14px 16px; }
   .credit-row { display: flex; align-items: center; justify-content: space-between; font-size: 14px; color: #666; margin-bottom: 8px; }
   .credit-row:last-child { margin-bottom: 0; padding-top: 10px; border-top: 1px solid #222; font-size: 17px; font-weight: 700; color: #fff; }
   .credit-row .val { color: #fbbf24; font-weight: 600; }
   .not-enough-btn { background: #f87171; color: #0f0f0f; border: none; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 700; cursor: pointer; margin-left: 8px; }
-
-  /* YOUTUBE SETTINGS */
   .yt-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; background: transparent; border: none; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; padding: 0; }
   .yt-arrow { color: #555; transition: transform 0.2s; }
   .yt-toggle.open .yt-arrow { transform: rotate(180deg); }
@@ -579,12 +449,12 @@ app.get('/', requireAuth, async (req, res) => {
   .toggle-slider:before { content: ''; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: #555; border-radius: 50%; transition: all 0.2s; }
   .toggle input:checked + .toggle-slider { background: rgba(251,191,36,0.2); }
   .toggle input:checked + .toggle-slider:before { transform: translateX(20px); background: #fbbf24; }
-
-  /* EXPORT BUTTONS */
   .export-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-  .export-option { border: 2px solid #2a2a2a; border-radius: 12px; padding: 16px; cursor: pointer; transition: all 0.15s; text-align: center; background: transparent; position: relative; }
-  .export-option:hover { border-color: #fbbf24; }
+  .export-option { border: 2px solid #2a2a2a; border-radius: 12px; padding: 16px; text-align: center; background: transparent; position: relative; }
+  .export-option.clickable { cursor: pointer; transition: all 0.15s; }
+  .export-option.clickable:hover { border-color: #fbbf24; }
   .export-option.selected { border-color: #fbbf24; background: rgba(251,191,36,0.08); }
+  .export-option.disabled { opacity: 0.45; cursor: not-allowed; }
   .export-option .check { position: absolute; top: 10px; right: 10px; width: 22px; height: 22px; border-radius: 50%; border: 2px solid #333; display: flex; align-items: center; justify-content: center; font-size: 12px; transition: all 0.15s; }
   .export-option.selected .check { background: #fbbf24; border-color: #fbbf24; color: #0f0f0f; }
   .export-option .icon { font-size: 28px; margin-bottom: 8px; display: block; }
@@ -592,21 +462,17 @@ app.get('/', requireAuth, async (req, res) => {
   .export-option .sublabel { font-size: 12px; color: #555; }
   .export-option .wm-note { font-size: 12px; color: #f87171; margin-top: 4px; }
   .export-option .wm-note.clear { color: #4ade80; }
-
+  .coming-soon-badge { display: inline-block; background: rgba(251,191,36,0.15); color: #fbbf24; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 99px; margin-top: 6px; }
   .go-btn { width: 100%; padding: 17px; font-size: 17px; font-weight: 800; border-radius: 12px; border: none; background: #fbbf24; color: #0f0f0f; cursor: pointer; transition: opacity 0.15s; }
   .go-btn:hover:not(:disabled) { opacity: 0.9; }
   .go-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
   .export-status { background: #111; border: 1px solid #222; border-radius: 10px; padding: 16px; margin-top: 12px; font-size: 14px; color: #777; display: none; }
   .export-status.active { display: block; }
   .progress-track { height: 4px; background: #222; border-radius: 99px; overflow: hidden; margin-top: 12px; }
   .progress-fill { height: 100%; background: #fbbf24; border-radius: 99px; width: 0%; transition: width 0.5s; }
   .result-box { margin-top: 12px; padding: 14px; background: #0f1a0f; border: 1px solid #166534; border-radius: 10px; color: #4ade80; font-size: 14px; display: none; }
-  .result-box a { color: #fbbf24; font-weight: 700; }
   .error-box { margin-top: 12px; padding: 14px; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); border-radius: 10px; color: #f87171; font-size: 14px; display: none; }
   .retry-btn { background: #fbbf24; color: #0f0f0f; border: none; border-radius: 8px; padding: 8px 16px; font-size: 14px; font-weight: 700; cursor: pointer; margin-top: 10px; }
-
-  /* AD MODAL */
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.88); z-index: 200; display: none; align-items: center; justify-content: center; padding: 1rem; }
   .modal-overlay.open { display: flex; }
   .modal { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 16px; padding: 2rem; max-width: 440px; width: 100%; }
@@ -629,7 +495,6 @@ app.get('/', requireAuth, async (req, res) => {
   .cooldown-timer { font-size: 36px; font-weight: 800; color: #a78bfa; margin: 10px 0; }
   .daily-box { background: #0f1a0f; border: 1px solid #166534; border-radius: 10px; padding: 1.5rem; text-align: center; color: #4ade80; margin-bottom: 1rem; }
   .slots-info { font-size: 13px; color: #555; text-align: center; margin-top: 6px; }
-
   #confetti-container { position: fixed; inset: 0; pointer-events: none; z-index: 999; }
   .confetti-piece { position: absolute; border-radius: 2px; animation: fall 3s ease-in forwards; }
   @keyframes fall { 0%{transform:translateY(-20px) rotate(0deg);opacity:1} 100%{transform:translateY(100vh) rotate(720deg);opacity:0} }
@@ -652,7 +517,6 @@ app.get('/', requireAuth, async (req, res) => {
 
 <div id="confetti-container"></div>
 
-<!-- AD MODAL -->
 <div class="modal-overlay" id="ad-modal">
   <div class="modal">
     <div class="modal-header">
@@ -666,11 +530,10 @@ app.get('/', requireAuth, async (req, res) => {
 
 <div class="main">
 
-  <!-- IMAGE + FIT OPTIONS -->
   <div class="card">
     <div class="section-label">Background Image</div>
     <div class="image-section">
-      <div class="yt-preview-wrap">
+      <div>
         <div class="yt-preview-label">Your Video Preview</div>
         <div class="yt-thumbnail" id="yt-thumb">
           <div class="upload-placeholder" id="upload-placeholder">
@@ -689,8 +552,7 @@ app.get('/', requireAuth, async (req, res) => {
           </div>
         </div>
       </div>
-
-      <div class="fit-options" id="fit-options">
+      <div class="fit-options">
         <div style="font-size:12px;color:#555;margin-bottom:6px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;">Fit options</div>
         <div class="fit-option active" id="fit-original" onclick="selectFit('original')">
           <div class="fit-thumb"><canvas id="thumb-original"></canvas></div>
@@ -710,8 +572,6 @@ app.get('/', requireAuth, async (req, res) => {
         </div>
       </div>
     </div>
-
-    <!-- WATERMARK + HD BADGES -->
     <div class="badge-row">
       <div class="badge wm-active" id="wm-badge">
         <span id="wm-text">⚠️ Watermark active</span>
@@ -724,7 +584,6 @@ app.get('/', requireAuth, async (req, res) => {
     </div>
   </div>
 
-  <!-- AUDIO -->
   <div class="card">
     <div class="section-label">Audio Tracks</div>
     <div class="track-list" id="track-list">
@@ -736,7 +595,6 @@ app.get('/', requireAuth, async (req, res) => {
     </button>
   </div>
 
-  <!-- FPS (hidden for images) -->
   <div class="card" id="fps-section" style="display:none">
     <div class="section-label">Frames Per Second</div>
     <div class="slider-input-row">
@@ -746,7 +604,6 @@ app.get('/', requireAuth, async (req, res) => {
     </div>
   </div>
 
-  <!-- LOOP + DURATION + FADE + COST -->
   <div class="card">
     <div class="section-label">Loop &amp; Duration</div>
     <div class="slider-input-row">
@@ -759,19 +616,11 @@ app.get('/', requireAuth, async (req, res) => {
       <input type="range" id="dur-slider" min="1" max="720" value="60" oninput="onDurSlider(this.value)" />
       <input type="text" id="dur-input" value="1:00:00" oninput="onDurText(this.value)" onblur="formatDurInput()" />
     </div>
-
     <div class="section-label" style="margin-top:16px;">Fade Effects</div>
     <div class="fade-grid">
-      <button class="fade-btn" id="fade-in-btn" onclick="toggleFade('in')">
-        ▶ Fade In
-        <div class="cost">+5 credits · 3 sec from black</div>
-      </button>
-      <button class="fade-btn" id="fade-out-btn" onclick="toggleFade('out')">
-        Fade Out ◀
-        <div class="cost">+5 credits · 3 sec to black</div>
-      </button>
+      <button class="fade-btn" id="fade-in-btn" onclick="toggleFade('in')">▶ Fade In<div class="cost">+5 credits · 3 sec from black</div></button>
+      <button class="fade-btn" id="fade-out-btn" onclick="toggleFade('out')">Fade Out ◀<div class="cost">+5 credits · 3 sec to black</div></button>
     </div>
-
     <div class="credit-cost-box">
       <div class="credit-row"><span>Duration cost</span><span class="val" id="cost-duration">20 credits</span></div>
       <div class="credit-row" id="cost-fadein-row" style="display:none"><span>Fade in</span><span class="val">+5 credits</span></div>
@@ -780,10 +629,9 @@ app.get('/', requireAuth, async (req, res) => {
     </div>
   </div>
 
-  <!-- YOUTUBE SETTINGS -->
   <div class="card">
     <button class="yt-toggle" id="yt-settings-toggle" onclick="toggleYT()">
-      <span>📺 YouTube Upload Settings</span>
+      <span>📺 Video Settings</span>
       <span class="yt-arrow">▼</span>
     </button>
     <div class="yt-body" id="yt-body">
@@ -797,7 +645,7 @@ app.get('/', requireAuth, async (req, res) => {
       </div>
       <div class="yt-row">
         <div class="yt-field">
-          <label>Visibility</label>
+          <label>Visibility (for when YouTube upload launches)</label>
           <select id="yt-visibility">
             <option value="public">Public</option>
             <option value="unlisted">Unlisted</option>
@@ -821,26 +669,25 @@ app.get('/', requireAuth, async (req, res) => {
     </div>
   </div>
 
-  <!-- EXPORT OPTIONS -->
   <div class="card">
     <div class="section-label">Export Options</div>
     <div class="export-btns">
-      <div class="export-option selected" id="opt-youtube" onclick="toggleExportOpt('youtube')">
+      <div class="export-option clickable selected" id="opt-download" onclick="toggleExportOpt('download')">
         <div class="check">✓</div>
-        <span class="icon">▶️</span>
-        <div class="label">Upload to YouTube</div>
-        <div class="sublabel">Direct to your channel</div>
-        <div class="wm-note" id="yt-wm-note">with watermark</div>
-      </div>
-      <div class="export-option" id="opt-download" onclick="toggleExportOpt('download')">
-        <div class="check"></div>
         <span class="icon">⬇️</span>
         <div class="label">Download MP4</div>
         <div class="sublabel">Save to your computer</div>
         <div class="wm-note" id="dl-wm-note">with watermark</div>
       </div>
+      <div class="export-option disabled" id="opt-youtube">
+        <div class="check"></div>
+        <span class="icon">▶️</span>
+        <div class="label">Upload to YouTube</div>
+        <div class="sublabel">Direct to your channel</div>
+        <div class="coming-soon-badge">Coming soon</div>
+      </div>
     </div>
-    <button class="go-btn" id="go-btn" onclick="startExport()">Export &amp; Upload</button>
+    <button class="go-btn" id="go-btn" onclick="startExport()">Export &amp; Download MP4</button>
     <div class="export-status" id="export-status">
       <div id="export-msg">Preparing...</div>
       <div class="progress-track"><div class="progress-fill" id="export-progress"></div></div>
@@ -860,7 +707,7 @@ let audioFiles = [], audioDurations = [];
 let fadeInActive = false, fadeOutActive = false;
 let isImageFile = false;
 let fitMode = 'original';
-let exportYT = true, exportDL = false;
+let exportDL = true;
 let uploadedImage = null;
 const TIERS = [0,10,25,45,75,125,190];
 const COLORS = ['#f87171','#fb923c','#facc15','#fbbf24','#34d399','#22d3ee','#818cf8'];
@@ -923,18 +770,14 @@ function updateCreditCost() {
   } else {
     totalEl.textContent = total+' credits';
   }
-  // Update go button
-  const goBtn = document.getElementById('go-btn');
-  if (exportYT && exportDL) goBtn.textContent = 'Export, Upload & Download';
-  else if (exportYT) goBtn.textContent = 'Export & Upload to YouTube';
-  else if (exportDL) goBtn.textContent = 'Export & Download MP4';
-  else goBtn.textContent = 'Select an export option above';
 }
 
 function toggleExportOpt(type) {
-  if (type==='youtube') { exportYT=!exportYT; document.getElementById('opt-youtube').classList.toggle('selected',exportYT); document.getElementById('opt-youtube').querySelector('.check').textContent=exportYT?'✓':''; }
-  else { exportDL=!exportDL; document.getElementById('opt-download').classList.toggle('selected',exportDL); document.getElementById('opt-download').querySelector('.check').textContent=exportDL?'✓':''; }
-  updateCreditCost();
+  if (type==='download') {
+    exportDL=!exportDL;
+    document.getElementById('opt-download').classList.toggle('selected',exportDL);
+    document.getElementById('opt-download').querySelector('.check').textContent=exportDL?'✓':'';
+  }
 }
 
 function selectFit(mode) {
@@ -964,8 +807,7 @@ function drawPreview() {
   const W = canvas.offsetWidth || 560, H = Math.round(W * 9/16);
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H);
   drawFit(ctx, uploadedImage, W, H, fitMode);
 }
 
@@ -978,18 +820,15 @@ function drawFit(ctx, img, W, H, mode) {
   } else if (mode==='stretch') {
     ctx.drawImage(img,0,0,W,H);
   } else if (mode==='blur') {
-    // Draw blurred background
     const scale=Math.max(W/iw,H/ih);
     const sw=W/scale, sh=H/scale, sx=(iw-sw)/2, sy=(ih-sh)/2;
     ctx.filter='blur(20px)';
     ctx.drawImage(img,sx,sy,sw,sh,-20,-20,W+40,H+40);
     ctx.filter='none';
-    // Draw original centered
     const scale2=Math.min(W/iw,H/ih);
     const dw=iw*scale2, dh=ih*scale2;
     ctx.drawImage(img,(W-dw)/2,(H-dh)/2,dw,dh);
   } else {
-    // original - letterbox
     const scale=Math.min(W/iw,H/ih);
     const dw=iw*scale, dh=ih*scale;
     ctx.drawImage(img,(W-dw)/2,(H-dh)/2,dw,dh);
@@ -1052,21 +891,17 @@ function updateBadges() {
   if (!state) return;
   const wmBadge=document.getElementById('wm-badge'), wmText=document.getElementById('wm-text'), wmBtn=document.getElementById('wm-btn');
   const hdBadge=document.getElementById('hd-badge'), hdText=document.getElementById('hd-text'), hdBtn=document.getElementById('hd-btn');
-  const wmNote1=document.getElementById('yt-wm-note'), wmNote2=document.getElementById('dl-wm-note');
-
+  const wmNote=document.getElementById('dl-wm-note');
   if (state.watermarkActive) {
     wmBadge.className='badge wm-active'; wmText.textContent='⚠️ Watermark active'; wmBtn.style.display=''; wmBtn.textContent='Watch 1 ad to remove'; wmBtn.disabled=false;
-    wmNote1.textContent='with watermark'; wmNote1.className='wm-note';
-    wmNote2.textContent='with watermark'; wmNote2.className='wm-note';
+    wmNote.textContent='with watermark'; wmNote.className='wm-note';
   } else {
     const h=Math.floor(state.watermarkSecsLeft/3600), m=Math.floor((state.watermarkSecsLeft%3600)/60);
     wmBadge.className='badge wm-removed'; wmText.textContent='✓ No watermark — '+(h>0?h+'h ':'')+m+'m left'; wmBtn.style.display='none';
-    wmNote1.textContent=''; wmNote1.className='wm-note clear';
-    wmNote2.textContent=''; wmNote2.className='wm-note clear';
+    wmNote.textContent=''; wmNote.className='wm-note clear';
   }
-
   if (state.hdActive) {
-    hdBadge.className='badge hd-active'; hdText.textContent='📺 720p — Free'; hdBtn.textContent='1080p for 24hrs — Watch 1 ad'; hdBtn.disabled=false;
+    hdBadge.className='badge hd-active'; hdText.textContent='📺 720p — Free'; hdBtn.textContent='1080p for 24hrs — Watch 1 ad'; hdBtn.disabled=false; hdBtn.style.display='';
   } else {
     const h=Math.floor(state.hdSecsLeft/3600), m=Math.floor((state.hdSecsLeft%3600)/60);
     hdBadge.className='badge hd-unlocked'; hdText.textContent='🎬 1080p unlocked — '+(h>0?h+'h ':'')+m+'m left'; hdBtn.style.display='none';
@@ -1132,7 +967,7 @@ async function fetchState() {
 async function startExport() {
   if (!document.getElementById('img-input').files[0]) { alert('Please select a background image'); return; }
   if (audioFiles.length===0) { alert('Please add at least one audio track'); return; }
-  if (!exportYT && !exportDL) { alert('Please select at least one export option'); return; }
+  if (!exportDL) { alert('Please select Download MP4'); return; }
   const secs=parseDur(document.getElementById('dur-input').value);
   const total=getCreditsForSecs(secs)+(fadeInActive?5:0)+(fadeOutActive?5:0);
   if (!state||state.credits<total){openAdModal();return;}
@@ -1156,8 +991,6 @@ async function startExport() {
   formData.append('fadeIn',fadeInActive);
   formData.append('fadeOut',fadeOutActive);
   formData.append('fitMode',fitMode);
-  formData.append('uploadYT',exportYT);
-  formData.append('downloadFile',exportDL);
   formData.append('ytTitle',document.getElementById('yt-title').value||'My Music Mix');
   formData.append('ytDesc',document.getElementById('yt-desc').value||'');
   formData.append('ytVisibility',document.getElementById('yt-visibility').value);
@@ -1170,28 +1003,14 @@ async function startExport() {
   try {
     const res=await fetch('/export',{method:'POST',body:formData});
     clearInterval(iv); progress.style.width='95%';
-
-    if (exportDL) {
-      if (!res.ok) { const e=await res.json(); throw new Error(e.error||'Export failed'); }
-      const ytUrl=res.headers.get('X-YT-URL');
-      const blob=await res.blob();
-      const url=URL.createObjectURL(blob);
-      const a=document.createElement('a'); a.href=url;
-      a.download=(document.getElementById('yt-title').value||'loopmixvideo')+'.mp4';
-      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-      progress.style.width='100%';
-      let resultHtml='✓ Video downloaded successfully!';
-      if (ytUrl) resultHtml+=\` <a href="\${ytUrl}" target="_blank">View on YouTube →</a>\`;
-      resultBox.innerHTML=resultHtml; resultBox.style.display='block';
-    } else {
-      if (!res.ok) { const e=await res.json(); throw new Error(e.error||'Export failed'); }
-      const data=await res.json();
-      progress.style.width='100%';
-      let resultHtml='';
-      if (data.ytUrl) { resultHtml='✓ Uploaded to YouTube! <a href="'+data.ytUrl+'" target="_blank">View video →</a>'; }
-      if (data.errors&&data.errors.length>0) { resultHtml+=(resultHtml?'<br>':'')+'⚠️ '+data.errors.join(', '); }
-      resultBox.innerHTML=resultHtml||'✓ Done!'; resultBox.style.display='block';
-    }
+    if (!res.ok) { const e=await res.json(); throw new Error(e.error||'Export failed'); }
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url;
+    a.download=(document.getElementById('yt-title').value||'loopmixvideo')+'.mp4';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    progress.style.width='100%';
+    resultBox.innerHTML='✓ Video downloaded successfully!'; resultBox.style.display='block';
     msg.textContent='✓ Complete!';
     await fetchState();
   } catch(e) {
