@@ -1,20 +1,16 @@
 const express = require('express');
 const { Pool } = require('pg');
 const session = require('express-session');
+const passport = require('passport');
+const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const multer = require('multer');
-const bcrypt = require('bcrypt');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const Stripe = require('stripe');
+const os = require('os');
 
 const app = express();
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
-// Raw body for Stripe webhooks
-app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 app.use(session({
   secret: process.env.SESSION_SECRET || 'fallback_secret',
@@ -23,1236 +19,988 @@ app.use(session({
   cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 }
 }));
 
+app.use(passport.initialize());
+app.use(passport.session());
+
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const activeStreams = new Map();
 
-const UPLOAD_DIR = '/app/uploads';
-const THUMB_DIR = '/app/thumbs';
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-if (!fs.existsSync(THUMB_DIR)) fs.mkdirSync(THUMB_DIR, { recursive: true });
+const CREDIT_TIERS = [0, 10, 25, 45, 75, 125, 190];
+const MAX_ADS_PER_BATCH = 6;
+const BATCH_COOLDOWN_MINUTES = 30;
+const DURATION_CREDITS = [
+  { maxSeconds: 600, credits: 5 },
+  { maxSeconds: 1800, credits: 10 },
+  { maxSeconds: 3600, credits: 20 },
+  { maxSeconds: 10800, credits: 40 },
+  { maxSeconds: 21600, credits: 75 },
+  { maxSeconds: 32400, credits: 125 },
+  { maxSeconds: 43200, credits: 170 },
+];
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => cb(null, req.session.userId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2) + path.extname(file.originalname))
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: 20 * 1024 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowed = ['.mp4','.mov','.avi','.mkv','.webm','.gif','.jpg','.jpeg','.png','.webp','.mp3','.wav','.aac','.ogg','.flac','.m4a'];
-    cb(null, allowed.includes(path.extname(file.originalname).toLowerCase()));
-  }
-});
+function getCreditsForDuration(seconds) {
+  for (const d of DURATION_CREDITS) { if (seconds <= d.maxSeconds) return d.credits; }
+  return 170;
+}
+
+// Track active FFmpeg processes for cancellation
+const activeExports = new Map(); // userId -> { proc, outputFile, tmpFiles }
 
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    email TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    plan TEXT NOT NULL DEFAULT 'free',
-    stream_slots INTEGER NOT NULL DEFAULT 0,
-    stripe_customer_id TEXT,
-    stripe_subscription_id TEXT,
-    subscription_status TEXT DEFAULT 'inactive',
-    created_at TIMESTAMP DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS streams (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    name TEXT NOT NULL DEFAULT 'My Stream',
-    stream_key TEXT,
-    file_path TEXT,
-    file_name TEXT,
-    thumb_path TEXT,
-    video_volume INTEGER NOT NULL DEFAULT 100,
-    video_muted BOOLEAN NOT NULL DEFAULT false,
-    audio_tracks JSONB NOT NULL DEFAULT '[]',
-    audio_volume INTEGER NOT NULL DEFAULT 100,
-    audio_muted BOOLEAN NOT NULL DEFAULT false,
-    resolution TEXT NOT NULL DEFAULT '1080p',
-    status TEXT NOT NULL DEFAULT 'stopped',
-    created_at TIMESTAMP DEFAULT NOW()
-  );
+    id TEXT PRIMARY KEY, email TEXT, name TEXT, avatar TEXT,
+    credits INTEGER NOT NULL DEFAULT 25,
+    last_daily_reset TIMESTAMP NOT NULL DEFAULT NOW(),
+    batch1_ads_used INTEGER NOT NULL DEFAULT 0,
+    batch2_ads_used INTEGER NOT NULL DEFAULT 0,
+    current_batch INTEGER NOT NULL DEFAULT 1,
+    batch_cooldown_until TIMESTAMP,
+    current_streak INTEGER NOT NULL DEFAULT 0,
+    watermark_removed_until TIMESTAMP,
+    hd_removed_until TIMESTAMP
+  )
 `).catch(console.error);
 
-pool.query(`
-  ALTER TABLE streams ADD COLUMN IF NOT EXISTS thumb_path TEXT;
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive';
-`).catch(console.error);
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, os.tmpdir()),
+  filename: (req, file, cb) => cb(null, Date.now() + '_' + Math.random().toString(36).slice(2) + path.extname(file.originalname))
+});
+const upload = multer({ storage, limits: { fileSize: 500 * 1024 * 1024 } });
 
-// Stripe price IDs — create these in Stripe dashboard
-const PLANS = {
-  starter: { name: 'Starter', price: 2, slots: 1, priceId: process.env.STRIPE_PRICE_STARTER || '' },
-  pro:     { name: 'Pro',     price: 5, slots: 1, priceId: process.env.STRIPE_PRICE_PRO || '' },
-  creator: { name: 'Creator', price: 12, slots: 3, priceId: process.env.STRIPE_PRICE_CREATOR || '' },
-  studio:  { name: 'Studio',  price: 20, slots: 6, priceId: process.env.STRIPE_PRICE_STUDIO || '' },
-};
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  callbackURL: 'https://loopmixvideo.com/auth/google/callback'
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    const existing = await pool.query('SELECT * FROM users WHERE id = $1', [profile.id]);
+    if (existing.rows.length === 0) {
+      await pool.query('INSERT INTO users (id, email, name, avatar) VALUES ($1, $2, $3, $4)',
+        [profile.id, profile.emails[0].value, profile.displayName, profile.photos[0].value]);
+    }
+    const user = await pool.query('SELECT * FROM users WHERE id = $1', [profile.id]);
+    return done(null, user.rows[0]);
+  } catch (e) { return done(e); }
+}));
+
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser(async (id, done) => {
+  try {
+    const res = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    done(null, res.rows[0]);
+  } catch (e) { done(e); }
+});
 
 function requireAuth(req, res, next) {
-  if (req.session.userId) return next();
+  if (req.isAuthenticated()) return next();
   res.redirect('/login');
 }
-function requireAuthApi(req, res, next) {
-  if (req.session.userId) return next();
-  res.status(401).json({ error: 'Not authenticated' });
-}
 
-app.get('/thumbs/:file', (req, res) => {
-  const p = path.join(THUMB_DIR, path.basename(req.params.file));
-  if (fs.existsSync(p)) res.sendFile(p);
-  else res.status(404).send('Not found');
-});
-
-async function generateThumb(filePath, streamId) {
-  const thumbFile = 'thumb_' + streamId + '_' + Date.now() + '.jpg';
-  const thumbPath = path.join(THUMB_DIR, thumbFile);
-  return new Promise((resolve) => {
-    const args = ['-i', filePath, '-ss', '0', '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:black', '-vframes', '1', '-y', thumbPath];
-    const proc = spawn('ffmpeg', args);
-    proc.on('close', (code) => {
-      if (code === 0 && fs.existsSync(thumbPath)) resolve('/thumbs/' + thumbFile);
-      else resolve(null);
-    });
-  });
-}
-
-function buildFFmpegArgs(stream) {
-  const width = stream.resolution === '1080p' ? 1920 : 1280;
-  const height = stream.resolution === '1080p' ? 1080 : 720;
-  const ext = path.extname(stream.file_path || '').toLowerCase();
-  const isImage = ['.jpg','.jpeg','.png','.webp'].includes(ext);
-  const isGif = ext === '.gif';
-  const tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks.filter(t => t.path && fs.existsSync(t.path)) : [];
-  const hasAudioTracks = tracks.length > 0;
-  const videoVol = stream.video_muted ? 0 : (stream.video_volume || 100) / 100;
-  const audioVol = stream.audio_muted ? 0 : (stream.audio_volume || 100) / 100;
-  const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
-  const rtmp = `rtmp://a.rtmp.youtube.com/live2/${stream.stream_key}`;
-  const args = [];
-
-  if (isImage) {
-    args.push('-loop', '1', '-framerate', '30', '-i', stream.file_path);
-  } else if (isGif) {
-    args.push('-re', '-stream_loop', '-1', '-ignore_loop', '0', '-i', stream.file_path);
-  } else {
-    args.push('-re', '-stream_loop', '-1', '-i', stream.file_path);
+async function checkDailyReset(userId) {
+  const res = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+  const user = res.rows[0];
+  if ((new Date() - new Date(user.last_daily_reset)) / (1000 * 60 * 60) >= 24) {
+    await pool.query(`UPDATE users SET credits = credits + 25, last_daily_reset = NOW(),
+      batch1_ads_used = 0, batch2_ads_used = 0, current_batch = 1,
+      batch_cooldown_until = NULL, current_streak = 0 WHERE id = $1`, [userId]);
+    return (await pool.query('SELECT * FROM users WHERE id = $1', [userId])).rows[0];
   }
-
-  for (const t of tracks) args.push('-stream_loop', '-1', '-i', t.path);
-
-  args.push(
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-threads', '0',
-    '-r', '30',
-    '-g', '60',
-    '-b:v', '2500k',
-    '-bufsize', '5000k',
-    '-maxrate', '2500k'
-  );
-  if (isImage) args.push('-tune', 'stillimage');
-  args.push('-vf', vf);
-
-  const videoHasAudio = !['.jpg','.jpeg','.png','.webp','.gif'].includes(ext);
-
-  if (hasAudioTracks && videoHasAudio) {
-    let fc = `[0:a]volume=${videoVol}[va];`;
-    for (let i = 0; i < tracks.length; i++) fc += `[${i+1}:a]volume=${audioVol}[a${i}];`;
-    const ins = ['[va]', ...tracks.map((_,i) => `[a${i}]`)].join('');
-    fc += `${ins}amix=inputs=${tracks.length+1}:duration=longest[aout]`;
-    args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
-  } else if (hasAudioTracks && !videoHasAudio) {
-    if (tracks.length === 1) {
-      args.push('-map', '0:v', '-map', '1:a', '-af', `volume=${audioVol}`);
-    } else {
-      let fc = '';
-      for (let i = 0; i < tracks.length; i++) fc += `[${i+1}:a]volume=${audioVol}[a${i}];`;
-      const ins = tracks.map((_,i) => `[a${i}]`).join('');
-      fc += `${ins}concat=n=${tracks.length}:v=0:a=1[aout]`;
-      args.push('-filter_complex', fc, '-map', '0:v', '-map', '[aout]');
-    }
-  } else if (!hasAudioTracks && videoHasAudio) {
-    args.push('-map', '0:v', '-map', '0:a', '-af', `volume=${videoVol}`);
-  } else {
-    args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-map', '0:v', '-map', '1:a');
-  }
-
-  args.push('-c:a', 'aac', '-b:a', '320k', '-ar', '44100', '-async', '1', '-f', 'flv', rtmp);
-  return args;
+  return user;
 }
 
-function startFFmpeg(streamId, streamData) {
-  if (!streamData.file_path || !fs.existsSync(streamData.file_path)) return;
-  if (!streamData.stream_key) return;
-  const existing = activeStreams.get(streamId);
-  if (existing) {
-    existing.restarting = true;
-    try { existing.proc.kill('SIGKILL'); } catch(e) {}
-  }
-  const args = buildFFmpegArgs(streamData);
-  const proc = spawn('ffmpeg', args);
-  const entry = { proc, restarting: false, streamData: { ...streamData } };
-  activeStreams.set(streamId, entry);
-  proc.stderr.on('data', () => {});
-  proc.on('close', () => {
-    const current = activeStreams.get(streamId);
-    if (current && !current.restarting) {
-      setTimeout(() => {
-        const cur = activeStreams.get(streamId);
-        if (cur && !cur.restarting) startFFmpeg(streamId, cur.streamData);
-      }, 3000);
-    }
-  });
+function cleanupFiles(tmpFiles) {
+  tmpFiles.forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(e) {} });
 }
 
-// ==================== LANDING ====================
-
-app.get('/', (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>StreamForCheap — 24/7 YouTube Streaming from $2/month</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0;}
-:root{--bg:#0a0a0a;--surface:#111;--surface2:#1a1a1a;--border:rgba(255,255,255,0.08);--text:#fff;--muted:#888;--accent:#aaff00;--accent-dim:rgba(170,255,0,0.1);--accent-dim2:rgba(170,255,0,0.05);}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden;}
-a{text-decoration:none;color:inherit;}
-nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,10,10,0.97);backdrop-filter:blur(10px);border-bottom:1px solid var(--border);padding:0 2rem;height:64px;display:flex;align-items:center;justify-content:space-between;}
-.nav-logo{font-size:20px;font-weight:800;letter-spacing:-0.5px;}
-.nav-logo .g{color:var(--accent);}
-.nav-links{display:flex;align-items:center;gap:8px;}
-.nav-links a{font-size:13px;font-weight:700;letter-spacing:0.05em;color:#aaa;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:7px 14px;transition:all 0.15s;text-transform:uppercase;}
-.nav-links a:hover{color:var(--accent);border-color:rgba(170,255,0,0.3);}
-.nav-auth{display:flex;align-items:center;gap:10px;}
-.nav-login{font-size:14px;color:var(--muted);transition:color 0.15s;}
-.nav-login:hover{color:var(--text);}
-.nav-btn{background:var(--accent);color:#000;padding:8px 20px;border-radius:8px;font-size:14px;font-weight:700;transition:opacity 0.15s;}
-.nav-btn:hover{opacity:0.85;color:#000;}
-.hero{padding:140px 2rem 100px;text-align:center;max-width:900px;margin:0 auto;}
-.hero-badge{display:inline-flex;align-items:center;gap:8px;background:var(--accent-dim);border:1px solid rgba(170,255,0,0.2);border-radius:99px;padding:6px 16px;font-size:13px;color:var(--accent);font-weight:600;margin-bottom:2rem;}
-.hero h1{font-size:clamp(36px,6vw,72px);font-weight:900;line-height:1.05;letter-spacing:-2px;margin-bottom:1.5rem;}
-.hero h1 span{color:var(--accent);}
-.hero p{font-size:18px;color:var(--muted);line-height:1.7;max-width:600px;margin:0 auto 2.5rem;}
-.hero-btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;}
-.btn-primary{background:var(--accent);color:#000;padding:14px 32px;border-radius:10px;font-size:16px;font-weight:800;transition:opacity 0.15s;cursor:pointer;border:none;}
-.btn-primary:hover{opacity:0.85;}
-.btn-secondary{background:var(--surface2);color:var(--text);padding:14px 32px;border-radius:10px;font-size:16px;font-weight:600;border:1px solid var(--border);transition:border-color 0.15s;cursor:pointer;}
-.btn-secondary:hover{border-color:var(--accent);}
-.hero-note{font-size:13px;color:var(--muted);margin-top:1rem;}
-.stats{display:flex;justify-content:center;gap:3rem;padding:3rem 2rem;border-top:1px solid var(--border);border-bottom:1px solid var(--border);flex-wrap:wrap;}
-.stat{text-align:center;}
-.stat-num{font-size:36px;font-weight:900;color:var(--accent);letter-spacing:-1px;}
-.stat-label{font-size:13px;color:var(--muted);margin-top:4px;}
-section{padding:80px 2rem;max-width:1100px;margin:0 auto;}
-.section-label{font-size:12px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--accent);margin-bottom:12px;}
-.section-title{font-size:clamp(28px,4vw,44px);font-weight:800;letter-spacing:-1px;margin-bottom:16px;}
-.section-sub{font-size:16px;color:var(--muted);line-height:1.7;max-width:560px;}
-.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:24px;margin-top:3rem;}
-.step{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.5rem;}
-.step-num{width:40px;height:40px;border-radius:10px;background:var(--accent-dim);border:1px solid rgba(170,255,0,0.2);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;color:var(--accent);margin-bottom:1rem;}
-.step h3{font-size:16px;font-weight:700;margin-bottom:8px;}
-.step p{font-size:14px;color:var(--muted);line-height:1.6;}
-.comparison{background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;margin-top:3rem;}
-.comparison-header{display:grid;grid-template-columns:2fr 1fr 1fr;padding:1rem 1.5rem;background:var(--surface2);border-bottom:1px solid var(--border);font-size:14px;font-weight:700;}
-.comparison-header .ours{color:var(--accent);}
-.comparison-row{display:grid;grid-template-columns:2fr 1fr 1fr;padding:1rem 1.5rem;border-bottom:1px solid var(--border);font-size:14px;align-items:center;}
-.comparison-row:last-child{border-bottom:none;}
-.comparison-row .feature{color:var(--muted);}
-.comparison-row .ours{color:var(--accent);font-weight:700;}
-.comparison-row .theirs{color:#555;}
-.pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:20px;margin-top:3rem;}
-.pricing-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:2rem;position:relative;transition:border-color 0.15s;}
-.pricing-card:hover{border-color:rgba(170,255,0,0.3);}
-.pricing-card.featured{border-color:var(--accent);background:var(--accent-dim2);}
-.pricing-badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--accent);color:#000;font-size:11px;font-weight:800;padding:4px 14px;border-radius:99px;white-space:nowrap;}
-.plan-name{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px;}
-.plan-price{font-size:48px;font-weight:900;letter-spacing:-2px;color:var(--text);margin-bottom:4px;}
-.plan-price span{font-size:18px;font-weight:400;color:var(--muted);}
-.plan-streams{font-size:14px;color:var(--muted);margin-bottom:1.5rem;padding-bottom:1.5rem;border-bottom:1px solid var(--border);}
-.plan-streams strong{color:var(--accent);}
-.plan-features{list-style:none;display:flex;flex-direction:column;gap:10px;margin-bottom:1.5rem;}
-.plan-features li{font-size:14px;color:#aaa;display:flex;align-items:center;gap:8px;}
-.plan-features li::before{content:'✓';color:var(--accent);font-weight:700;flex-shrink:0;}
-.plan-btn{width:100%;padding:12px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;border:none;transition:opacity 0.15s;text-align:center;display:block;}
-.plan-btn-primary{background:var(--accent);color:#000;}
-.plan-btn-primary:hover{opacity:0.85;}
-.plan-btn-secondary{background:var(--surface2);color:var(--text);border:1px solid var(--border);}
-.plan-btn-secondary:hover{border-color:var(--accent);}
-.faq{margin-top:3rem;display:flex;flex-direction:column;gap:12px;}
-.faq-item{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;}
-.faq-q{padding:1.25rem 1.5rem;font-size:15px;font-weight:600;cursor:pointer;display:flex;justify-content:space-between;align-items:center;}
-.faq-q:hover{color:var(--accent);}
-.faq-arrow{color:var(--muted);transition:transform 0.2s;font-size:12px;}
-.faq-item.open .faq-arrow{transform:rotate(180deg);}
-.faq-a{padding:0 1.5rem;max-height:0;overflow:hidden;transition:max-height 0.3s,padding 0.3s;font-size:14px;color:var(--muted);line-height:1.7;}
-.faq-item.open .faq-a{max-height:200px;padding:0 1.5rem 1.25rem;}
-footer{border-top:1px solid var(--border);padding:3rem 2rem;text-align:center;}
-.footer-logo{font-size:20px;font-weight:800;margin-bottom:1rem;}
-.footer-logo .g{color:var(--accent);}
-.footer-links{display:flex;gap:2rem;justify-content:center;flex-wrap:wrap;margin-bottom:1.5rem;}
-.footer-links a{font-size:13px;color:var(--muted);transition:color 0.15s;}
-.footer-links a:hover{color:var(--text);}
-.footer-copy{font-size:12px;color:#444;}
-@media(max-width:600px){.nav-links{display:none;}.comparison-header,.comparison-row{grid-template-columns:1.5fr 1fr 1fr;font-size:12px;padding:0.75rem 1rem;}}
-</style>
-</head>
-<body>
-<nav>
-  <a href="/" class="nav-logo">stream<span class="g">forcheap</span></a>
-  <div class="nav-links">
-    <a href="#how">HOW IT WORKS</a>
-    <a href="#pricing">PRICING</a>
-    <a href="#faq">FAQ</a>
-  </div>
-  <div class="nav-auth">
-    <a href="/login" class="nav-login">Log in</a>
-    <a href="/register" class="nav-btn">Get started</a>
-  </div>
-</nav>
-<div class="hero">
-  <div class="hero-badge">🟢 Streams running 24/7</div>
-  <h1>24/7 YouTube Streaming<br>from <span>$2/month</span></h1>
-  <p>Upload your video, enter your stream key, and we stream it to YouTube forever. No PC needed. No technical knowledge required.</p>
-  <div class="hero-btns">
-    <button class="btn-primary" onclick="document.getElementById('pricing').scrollIntoView({behavior:'smooth'})">Start streaming — from $2/mo</button>
-    <button class="btn-secondary" onclick="document.getElementById('how').scrollIntoView({behavior:'smooth'})">See how it works</button>
-  </div>
-  <div class="hero-note">Cancel anytime · No hidden fees</div>
-</div>
-<div class="stats">
-  <div class="stat"><div class="stat-num">$2</div><div class="stat-label">starting per month</div></div>
-  <div class="stat"><div class="stat-num">24/7</div><div class="stat-label">always streaming</div></div>
-  <div class="stat"><div class="stat-num">1080p</div><div class="stat-label">full HD quality</div></div>
-  <div class="stat"><div class="stat-num">10x</div><div class="stat-label">cheaper than competitors</div></div>
-</div>
-<section id="how">
-  <div class="section-label">How it works</div>
-  <div class="section-title">Up and running in 3 minutes</div>
-  <p class="section-sub">No technical knowledge needed. If you can upload a file, you can set up a 24/7 stream.</p>
-  <div class="steps">
-    <div class="step"><div class="step-num">1</div><h3>Create your account</h3><p>Sign up and choose your plan. Cancel anytime.</p></div>
-    <div class="step"><div class="step-num">2</div><h3>Upload your content</h3><p>Upload any image, GIF, or video file. Add separate audio tracks too.</p></div>
-    <div class="step"><div class="step-num">3</div><h3>Add your stream key</h3><p>Paste your YouTube stream key from YouTube Studio → Go Live → Stream.</p></div>
-    <div class="step"><div class="step-num">4</div><h3>Hit start</h3><p>Your stream goes live instantly and runs 24/7. Turn off your PC — we handle everything.</p></div>
-  </div>
-</section>
-<section>
-  <div class="section-label">Comparison</div>
-  <div class="section-title">Why pay more?</div>
-  <p class="section-sub">We do exactly what the expensive tools do, for a fraction of the price.</p>
-  <div class="comparison">
-    <div class="comparison-header"><div>Feature</div><div class="ours">StreamForCheap</div><div>Competitors</div></div>
-    <div class="comparison-row"><div class="feature">Price per stream</div><div class="ours">from $2/month</div><div class="theirs">$24–49/month</div></div>
-    <div class="comparison-row"><div class="feature">24/7 streaming</div><div class="ours" style="color:#aaff00">✓</div><div style="color:#aaff00">✓</div></div>
-    <div class="comparison-row"><div class="feature">1080p quality</div><div class="ours" style="color:#aaff00">✓</div><div style="color:#aaff00">✓</div></div>
-    <div class="comparison-row"><div class="feature">Image, GIF &amp; video support</div><div class="ours" style="color:#aaff00">✓</div><div style="color:#aaff00">✓</div></div>
-    <div class="comparison-row"><div class="feature">Auto-restart on crash</div><div class="ours" style="color:#aaff00">✓</div><div style="color:#aaff00">✓</div></div>
-    <div class="comparison-row"><div class="feature">Separate audio tracks</div><div class="ours" style="color:#aaff00">✓</div><div style="color:#f87171">✗ extra cost</div></div>
-    <div class="comparison-row"><div class="feature">Real-time volume control</div><div class="ours" style="color:#aaff00">✓</div><div style="color:#f87171">✗</div></div>
-    <div class="comparison-row"><div class="feature">No watermark</div><div class="ours" style="color:#aaff00">✓</div><div style="color:#f87171">✗ paid plans only</div></div>
-  </div>
-</section>
-<section id="pricing">
-  <div class="section-label">Pricing</div>
-  <div class="section-title">Simple, honest pricing</div>
-  <p class="section-sub">No hidden fees. No per-platform charges. No watermarks. Cancel anytime.</p>
-  <div class="pricing-grid">
-    <div class="pricing-card">
-      <div class="plan-name">Starter</div>
-      <div class="plan-price">$2<span>/mo</span></div>
-      <div class="plan-streams"><strong>1 stream</strong> — static image only</div>
-      <ul class="plan-features"><li>720p quality</li><li>24/7 streaming</li><li>Separate audio tracks</li><li>Auto-restart on crash</li><li>No watermark</li></ul>
-      <button class="plan-btn plan-btn-secondary" onclick="choosePlan('starter')">Get started</button>
-    </div>
-    <div class="pricing-card featured">
-      <div class="pricing-badge">MOST POPULAR</div>
-      <div class="plan-name">Pro</div>
-      <div class="plan-price">$5<span>/mo</span></div>
-      <div class="plan-streams"><strong>1 stream</strong> — image, GIF, or video loop</div>
-      <ul class="plan-features"><li>1080p quality</li><li>24/7 streaming</li><li>Separate audio tracks</li><li>Real-time volume control</li><li>Auto-restart on crash</li><li>No watermark</li></ul>
-      <button class="plan-btn plan-btn-primary" onclick="choosePlan('pro')">Get started</button>
-    </div>
-    <div class="pricing-card">
-      <div class="plan-name">Creator</div>
-      <div class="plan-price">$12<span>/mo</span></div>
-      <div class="plan-streams"><strong>3 streams</strong> — image, GIF, or video loop</div>
-      <ul class="plan-features"><li>1080p quality</li><li>24/7 streaming</li><li>Separate audio tracks</li><li>Real-time volume control</li><li>Auto-restart on crash</li><li>No watermark</li></ul>
-      <button class="plan-btn plan-btn-secondary" onclick="choosePlan('creator')">Get started</button>
-    </div>
-    <div class="pricing-card">
-      <div class="plan-name">Studio</div>
-      <div class="plan-price">$20<span>/mo</span></div>
-      <div class="plan-streams"><strong>6 streams</strong> — image, GIF, or video loop</div>
-      <ul class="plan-features"><li>1080p quality</li><li>24/7 streaming</li><li>Separate audio tracks</li><li>Real-time volume control</li><li>Auto-restart on crash</li><li>No watermark</li></ul>
-      <button class="plan-btn plan-btn-secondary" onclick="choosePlan('studio')">Get started</button>
-    </div>
-  </div>
-</section>
-<section id="faq">
-  <div class="section-label">FAQ</div>
-  <div class="section-title">Got questions?</div>
-  <div class="faq">
-    <div class="faq-item"><div class="faq-q" onclick="this.closest('.faq-item').classList.toggle('open')">Do I need to keep my computer on? <span class="faq-arrow">▼</span></div><div class="faq-a">No. Once you start your stream it runs on our servers 24/7. You can turn off your PC completely.</div></div>
-    <div class="faq-item"><div class="faq-q" onclick="this.closest('.faq-item').classList.toggle('open')">What file types are supported? <span class="faq-arrow">▼</span></div><div class="faq-a">Images (JPG, PNG, WebP), GIFs, videos (MP4, MOV, AVI, MKV, WebM), and audio (MP3, WAV, AAC, OGG, FLAC).</div></div>
-    <div class="faq-item"><div class="faq-q" onclick="this.closest('.faq-item').classList.toggle('open')">Where do I find my YouTube stream key? <span class="faq-arrow">▼</span></div><div class="faq-a">Go to YouTube Studio → Go Live → Stream. Keep it private — anyone with it can stream to your channel.</div></div>
-    <div class="faq-item"><div class="faq-q" onclick="this.closest('.faq-item').classList.toggle('open')">What happens if the stream crashes? <span class="faq-arrow">▼</span></div><div class="faq-a">Our system automatically detects crashes and restarts your stream within seconds.</div></div>
-    <div class="faq-item"><div class="faq-q" onclick="this.closest('.faq-item').classList.toggle('open')">Can I use separate audio tracks? <span class="faq-arrow">▼</span></div><div class="faq-a">Yes. Upload multiple audio files and they play one after another in a loop. Control video and audio volume independently.</div></div>
-    <div class="faq-item"><div class="faq-q" onclick="this.closest('.faq-item').classList.toggle('open')">Can I cancel anytime? <span class="faq-arrow">▼</span></div><div class="faq-a">Yes. Cancel anytime from your dashboard. No contracts, no cancellation fees. Your streams stop at the end of the billing period.</div></div>
-  </div>
-</section>
-<footer>
-  <div class="footer-logo">stream<span class="g">forcheap</span></div>
-  <div class="footer-links"><a href="#how">How it works</a><a href="#pricing">Pricing</a><a href="#faq">FAQ</a><a href="/login">Login</a><a href="/register">Sign up</a></div>
-  <div class="footer-copy">© 2026 StreamForCheap. The cheapest 24/7 streaming service on the internet.</div>
-</footer>
-<script>
-function choosePlan(plan) {
-  // Store chosen plan and redirect to register/login
-  sessionStorage.setItem('chosen_plan', plan);
-  fetch('/api/me').then(r => r.json()).then(data => {
-    if (data.userId) {
-      window.location.href = '/checkout?plan=' + plan;
-    } else {
-      window.location.href = '/register?plan=' + plan;
-    }
-  }).catch(() => {
-    window.location.href = '/register?plan=' + plan;
-  });
-}
-</script>
-</body>
-</html>`);
-});
-
-// ==================== AUTH ====================
-
-app.get('/api/me', (req, res) => {
-  res.json({ userId: req.session.userId || null });
-});
-
-app.get('/register', (req, res) => {
-  const plan = req.query.plan || 'pro';
-  if (req.session.userId) return res.redirect('/checkout?plan=' + plan);
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Sign Up — StreamForCheap</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;}
-.card{background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:2.5rem;max-width:440px;width:100%;}
-.logo{font-size:20px;font-weight:800;margin-bottom:2rem;text-align:center;}.logo .g{color:#aaff00;}
-h1{font-size:24px;font-weight:800;margin-bottom:8px;}.sub{color:#666;font-size:14px;margin-bottom:2rem;}
-.plan-banner{background:rgba(170,255,0,0.08);border:1px solid rgba(170,255,0,0.2);border-radius:10px;padding:12px 16px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;}
-.plan-banner .pname{font-size:15px;font-weight:700;color:#aaff00;}
-.plan-banner .pprice{font-size:13px;color:#888;}
-.field{margin-bottom:16px;}.field label{font-size:13px;color:#888;display:block;margin-bottom:6px;}
-.field input{width:100%;padding:12px 14px;background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;font-size:15px;outline:none;transition:border-color 0.15s;font-family:inherit;}
-.field input:focus{border-color:#aaff00;}
-.btn{width:100%;padding:13px;background:#aaff00;color:#000;font-size:15px;font-weight:700;border-radius:10px;border:none;cursor:pointer;transition:opacity 0.15s;margin-top:8px;}
-.btn:hover{opacity:0.85;}.btn:disabled{opacity:0.5;cursor:not-allowed;}
-.link{text-align:center;font-size:13px;color:#666;margin-top:1.5rem;}.link a{color:#aaff00;}
-.error{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:#f87171;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;display:none;}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="logo"><a href="/" style="text-decoration:none;color:inherit;">stream<span class="g">forcheap</span></a></div>
-  <h1>Create account</h1>
-  <p class="sub">You're signing up for the ${plan.charAt(0).toUpperCase()+plan.slice(1)} plan</p>
-  <div class="plan-banner">
-    <span class="pname">${plan.charAt(0).toUpperCase()+plan.slice(1)} Plan</span>
-    <span class="pprice">$${PLANS[plan]?.price || 5}/month · cancel anytime</span>
-  </div>
-  <div class="error" id="error"></div>
-  <div class="field"><label>Email address</label><input type="email" id="email" placeholder="you@example.com"/></div>
-  <div class="field"><label>Password</label><input type="password" id="password" placeholder="Min 8 characters"/></div>
-  <div class="field"><label>Confirm password</label><input type="password" id="password2" placeholder="Repeat password"/></div>
-  <button class="btn" id="btn" onclick="register()">Continue to payment →</button>
-  <div class="link">Already have an account? <a href="/login?plan=${plan}">Log in</a></div>
-</div>
-<script>
-async function register(){
-  const email=document.getElementById('email').value.trim();
-  const pw=document.getElementById('password').value;
-  const pw2=document.getElementById('password2').value;
-  const err=document.getElementById('error');const btn=document.getElementById('btn');
-  err.style.display='none';
-  if(!email||!pw){err.textContent='Please fill in all fields';err.style.display='block';return;}
-  if(pw.length<8){err.textContent='Password must be at least 8 characters';err.style.display='block';return;}
-  if(pw!==pw2){err.textContent='Passwords do not match';err.style.display='block';return;}
-  btn.disabled=true;btn.textContent='Creating account...';
-  try{
-    const res=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw,plan:'${plan}'})});
-    const data=await res.json();
-    if(data.error){err.textContent=data.error;err.style.display='block';btn.disabled=false;btn.textContent='Continue to payment →';return;}
-    window.location.href='/checkout?plan=${plan}';
-  }catch(e){err.textContent='Something went wrong.';err.style.display='block';btn.disabled=false;btn.textContent='Continue to payment →';}
-}
-document.addEventListener('keydown',e=>{if(e.key==='Enter')register();});
-</script>
-</body>
-</html>`);
-});
+app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+app.get('/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), (req, res) => res.redirect('/'));
+app.get('/logout', (req, res) => { req.logout(() => res.redirect('/login')); });
 
 app.get('/login', (req, res) => {
-  const plan = req.query.plan || '';
-  if (req.session.userId) return res.redirect(plan ? '/checkout?plan='+plan : '/dashboard');
+  if (req.isAuthenticated()) return res.redirect('/');
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Log In — StreamForCheap</title>
+<title>LoopmixVideo</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;}
-.card{background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:2.5rem;max-width:420px;width:100%;}
-.logo{font-size:20px;font-weight:800;margin-bottom:2rem;text-align:center;}.logo .g{color:#aaff00;}
-h1{font-size:24px;font-weight:800;margin-bottom:8px;}.sub{color:#666;font-size:14px;margin-bottom:2rem;}
-.field{margin-bottom:16px;}.field label{font-size:13px;color:#888;display:block;margin-bottom:6px;}
-.field input{width:100%;padding:12px 14px;background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;font-size:15px;outline:none;transition:border-color 0.15s;font-family:inherit;}
-.field input:focus{border-color:#aaff00;}
-.btn{width:100%;padding:13px;background:#aaff00;color:#000;font-size:15px;font-weight:700;border-radius:10px;border:none;cursor:pointer;transition:opacity 0.15s;margin-top:8px;}
-.btn:hover{opacity:0.85;}.btn:disabled{opacity:0.5;cursor:not-allowed;}
-.link{text-align:center;font-size:13px;color:#666;margin-top:1.5rem;}.link a{color:#aaff00;}
-.error{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:#f87171;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;display:none;}
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #fff; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 16px; padding: 2.5rem; max-width: 420px; width: 100%; text-align: center; }
+  .logo { font-size: 48px; margin-bottom: 1rem; }
+  h1 { font-size: 28px; font-weight: 800; margin-bottom: 8px; letter-spacing: -0.5px; }
+  .sub { color: #666; font-size: 15px; margin-bottom: 2rem; line-height: 1.6; }
+  .features { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 2rem; }
+  .feature { background: #111; border: 1px solid #222; border-radius: 10px; padding: 12px; font-size: 13px; color: #666; text-align: left; }
+  .feature strong { display: block; color: #fbbf24; font-size: 14px; margin-bottom: 3px; }
+  .btn-google { display: flex; align-items: center; justify-content: center; gap: 12px; width: 100%; padding: 15px; background: #fff; color: #000; font-size: 16px; font-weight: 700; border-radius: 12px; border: none; cursor: pointer; text-decoration: none; transition: opacity 0.15s; }
+  .btn-google:hover { opacity: 0.9; }
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="logo"><a href="/" style="text-decoration:none;color:inherit;">stream<span class="g">forcheap</span></a></div>
-  <h1>Welcome back</h1>
-  <p class="sub">Log in to ${plan ? 'continue to checkout' : 'manage your streams'}</p>
-  <div class="error" id="error"></div>
-  <div class="field"><label>Email address</label><input type="email" id="email" placeholder="you@example.com"/></div>
-  <div class="field"><label>Password</label><input type="password" id="password" placeholder="Your password"/></div>
-  <button class="btn" id="btn" onclick="login()">Log in</button>
-  <div class="link">Don't have an account? <a href="/register${plan?'?plan='+plan:''}">Sign up</a></div>
+  <div class="logo">🎬</div>
+  <h1>LoopmixVideo</h1>
+  <p class="sub">Create long music mix videos for YouTube.<br>Free. No watermark. No subscription.</p>
+  <div class="features">
+    <div class="feature"><strong>Up to 12 hours</strong>Long music mixes</div>
+    <div class="feature"><strong>Free exports</strong>Watch ads for credits</div>
+    <div class="feature"><strong>No watermark</strong>Watch 1 ad to remove</div>
+    <div class="feature"><strong>MP4 download</strong>Ready for YouTube</div>
+  </div>
+  <a href="/auth/google" class="btn-google">
+    <img src="https://www.google.com/favicon.ico" width="20" height="20" alt="G" />
+    Sign in with Google
+  </a>
 </div>
-<script>
-const redirectPlan='${plan}';
-async function login(){
-  const email=document.getElementById('email').value.trim();
-  const pw=document.getElementById('password').value;
-  const err=document.getElementById('error');const btn=document.getElementById('btn');
-  err.style.display='none';
-  if(!email||!pw){err.textContent='Please fill in all fields';err.style.display='block';return;}
-  btn.disabled=true;btn.textContent='Logging in...';
-  try{
-    const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});
-    const data=await res.json();
-    if(data.error){err.textContent=data.error;err.style.display='block';btn.disabled=false;btn.textContent='Log in';return;}
-    if(redirectPlan){window.location.href='/checkout?plan='+redirectPlan;}
-    else{window.location.href='/dashboard';}
-  }catch(e){err.textContent='Something went wrong.';err.style.display='block';btn.disabled=false;btn.textContent='Log in';}
-}
-document.addEventListener('keydown',e=>{if(e.key==='Enter')login();});
-</script>
 </body>
 </html>`);
 });
 
-// ==================== CHECKOUT ====================
-
-app.get('/checkout', requireAuth, async (req, res) => {
-  const plan = req.query.plan || 'pro';
-  const planData = PLANS[plan];
-  if (!planData) return res.redirect('/');
-  const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
-
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Checkout — StreamForCheap</title>
-<script src="https://js.stripe.com/v3/"></script>
-<style>
-*{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;}
-.checkout-wrap{display:grid;grid-template-columns:1fr 1fr;gap:2rem;max-width:860px;width:100%;}
-.order-summary{background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:2rem;}
-.order-summary h2{font-size:18px;font-weight:800;margin-bottom:1.5rem;color:#888;text-transform:uppercase;font-size:12px;letter-spacing:0.1em;}
-.plan-box{background:#1a1a1a;border:1px solid rgba(170,255,0,0.2);border-radius:12px;padding:1.5rem;margin-bottom:1.5rem;}
-.plan-box .pname{font-size:22px;font-weight:800;margin-bottom:4px;}
-.plan-box .pdesc{font-size:14px;color:#888;margin-bottom:1rem;}
-.plan-box .price-row{display:flex;align-items:baseline;gap:6px;}
-.plan-box .price{font-size:42px;font-weight:900;color:#aaff00;}
-.plan-box .per{font-size:16px;color:#888;}
-.features{list-style:none;display:flex;flex-direction:column;gap:8px;}
-.features li{font-size:14px;color:#aaa;display:flex;align-items:center;gap:8px;}
-.features li::before{content:'✓';color:#aaff00;font-weight:700;}
-.divider{border:none;border-top:1px solid rgba(255,255,255,0.08);margin:1.5rem 0;}
-.total-row{display:flex;justify-content:space-between;align-items:center;font-size:16px;}
-.total-row strong{font-size:20px;color:#aaff00;}
-.payment-form{background:#111;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:2rem;}
-.payment-form h2{font-size:12px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:1.5rem;}
-.field{margin-bottom:16px;}.field label{font-size:13px;color:#888;display:block;margin-bottom:6px;}
-.field input{width:100%;padding:12px 14px;background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;font-size:15px;outline:none;transition:border-color 0.15s;font-family:inherit;}
-.field input:focus{border-color:#aaff00;}
-#card-element{background:#1a1a1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:14px;}
-#card-errors{color:#f87171;font-size:13px;margin-top:8px;display:none;}
-.pay-btn{width:100%;padding:15px;background:#aaff00;color:#000;font-size:16px;font-weight:800;border-radius:10px;border:none;cursor:pointer;transition:opacity 0.15s;margin-top:16px;}
-.pay-btn:hover{opacity:0.85;}.pay-btn:disabled{opacity:0.5;cursor:not-allowed;}
-.secure-note{display:flex;align-items:center;justify-content:center;gap:6px;font-size:12px;color:#555;margin-top:12px;}
-.back-link{font-size:13px;color:#555;text-align:center;margin-top:1rem;display:block;}
-.back-link:hover{color:#fff;}
-@media(max-width:700px){.checkout-wrap{grid-template-columns:1fr;}}
-</style>
-</head>
-<body>
-<div class="checkout-wrap">
-  <div class="order-summary">
-    <h2>Order Summary</h2>
-    <div class="plan-box">
-      <div class="pname">${planData.name} Plan</div>
-      <div class="pdesc">${planData.slots} stream${planData.slots>1?'s':''} · 24/7 · Cancel anytime</div>
-      <div class="price-row">
-        <span class="price">$${planData.price}</span>
-        <span class="per">/month</span>
-      </div>
-    </div>
-    <ul class="features">
-      <li>24/7 YouTube streaming</li>
-      <li>${plan==='starter'?'720p quality':'1080p quality'}</li>
-      <li>Separate audio tracks</li>
-      <li>Auto-restart on crash</li>
-      <li>No watermark</li>
-      <li>Cancel anytime</li>
-    </ul>
-    <div class="divider"></div>
-    <div class="total-row">
-      <span>Total per month</span>
-      <strong>$${planData.price}/mo</strong>
-    </div>
-  </div>
-  <div class="payment-form">
-    <h2>Payment Details</h2>
-    <div class="field">
-      <label>Email</label>
-      <input type="text" value="${user.email}" disabled style="opacity:0.6;"/>
-    </div>
-    <div class="field">
-      <label>Card details</label>
-      <div id="card-element"></div>
-      <div id="card-errors"></div>
-    </div>
-    <button class="pay-btn" id="pay-btn" onclick="handlePayment()">Subscribe — $${planData.price}/month</button>
-    <div class="secure-note">🔒 Secured by Stripe · Cancel anytime</div>
-    <a href="/#pricing" class="back-link">← Back to pricing</a>
-  </div>
-</div>
-<script>
-const stripe = Stripe('${process.env.STRIPE_PUBLISHABLE_KEY}');
-const elements = stripe.elements();
-const card = elements.create('card', {
-  style: {
-    base: { color: '#fff', fontFamily: '-apple-system, sans-serif', fontSize: '15px', '::placeholder': { color: '#555' } },
-    invalid: { color: '#f87171' }
-  }
-});
-card.mount('#card-element');
-card.on('change', e => {
-  const err = document.getElementById('card-errors');
-  if(e.error){err.textContent=e.error.message;err.style.display='block';}
-  else{err.style.display='none';}
-});
-
-async function handlePayment(){
-  const btn = document.getElementById('pay-btn');
-  btn.disabled = true; btn.textContent = 'Processing...';
+app.get('/state', requireAuth, async (req, res) => {
   try {
-    const intentRes = await fetch('/api/create-subscription', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ plan: '${plan}' })
+    const user = await checkDailyReset(req.user.id);
+    const now = new Date();
+    const batchAdsUsed = user.current_batch === 1 ? user.batch1_ads_used : user.batch2_ads_used;
+    const inCooldown = user.batch_cooldown_until && new Date(user.batch_cooldown_until) > now;
+    const batchesUsed = user.batch1_ads_used >= 6 && user.batch2_ads_used >= 6;
+    const watermarkActive = !user.watermark_removed_until || new Date(user.watermark_removed_until) <= now;
+    const hdActive = !user.hd_removed_until || new Date(user.hd_removed_until) <= now;
+    res.json({
+      credits: user.credits, name: user.name, avatar: user.avatar,
+      currentStreak: user.current_streak,
+      currentTierCredits: CREDIT_TIERS[user.current_streak] || 0,
+      nextTierCredits: CREDIT_TIERS[user.current_streak + 1] || null,
+      adsRemainingInBatch: MAX_ADS_PER_BATCH - batchAdsUsed,
+      currentBatch: user.current_batch, inCooldown,
+      cooldownSecsLeft: inCooldown ? Math.ceil((new Date(user.batch_cooldown_until) - now) / 1000) : 0,
+      batchesUsed,
+      canWatchAd: !inCooldown && !batchesUsed && (MAX_ADS_PER_BATCH - batchAdsUsed) > 0,
+      watermarkActive,
+      watermarkSecsLeft: !watermarkActive ? Math.ceil((new Date(user.watermark_removed_until) - now) / 1000) : 0,
+      hdActive,
+      hdSecsLeft: !hdActive ? Math.ceil((new Date(user.hd_removed_until) - now) / 1000) : 0,
+      isExporting: activeExports.has(req.user.id)
     });
-    const intentData = await intentRes.json();
-    if(intentData.error){ throw new Error(intentData.error); }
-
-    const result = await stripe.confirmCardPayment(intentData.clientSecret, {
-      payment_method: { card }
-    });
-
-    if(result.error){ throw new Error(result.error.message); }
-
-    // Payment confirmed
-    window.location.href = '/dashboard?welcome=1';
-  } catch(e) {
-    const err = document.getElementById('card-errors');
-    err.textContent = e.message; err.style.display = 'block';
-    btn.disabled = false; btn.textContent = 'Subscribe — $${planData.price}/month';
-  }
-}
-</script>
-</body>
-</html>`);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/dashboard', requireAuth, async (req, res) => {
-  const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
-  const streams = (await pool.query('SELECT * FROM streams WHERE user_id=$1 ORDER BY created_at DESC', [req.session.userId])).rows;
-  const planSlots = { starter:1, pro:1, creator:3, studio:6 };
-  const maxSlots = planSlots[user.plan] || 0;
-  const liveMap = {};
-  streams.forEach(s => { liveMap[s.id] = activeStreams.has(s.id); });
-  const welcome = req.query.welcome === '1';
-  const hasActivePlan = user.subscription_status === 'active' || user.plan !== 'free';
+app.post('/watch-ad', requireAuth, async (req, res) => {
+  try {
+    const user = await checkDailyReset(req.user.id);
+    const now = new Date();
+    const batchAdsUsed = user.current_batch === 1 ? user.batch1_ads_used : user.batch2_ads_used;
+    const inCooldown = user.batch_cooldown_until && new Date(user.batch_cooldown_until) > now;
+    const batchesUsed = user.batch1_ads_used >= 6 && user.batch2_ads_used >= 6;
+    if (inCooldown) return res.status(400).json({ error: 'In cooldown' });
+    if (batchesUsed) return res.status(400).json({ error: 'No more ads today' });
+    if (batchAdsUsed >= MAX_ADS_PER_BATCH) return res.status(400).json({ error: 'Batch full' });
+    const newStreak = user.current_streak + 1;
+    const batchCol = user.current_batch === 1 ? 'batch1_ads_used' : 'batch2_ads_used';
+    await pool.query(`UPDATE users SET current_streak = $1, ${batchCol} = ${batchCol} + 1 WHERE id = $2`, [newStreak, req.user.id]);
+    res.json({ newStreak, offeredCredits: CREDIT_TIERS[newStreak], isMaxStreak: newStreak === MAX_ADS_PER_BATCH, canContinue: newStreak < MAX_ADS_PER_BATCH && (batchAdsUsed + 1) < MAX_ADS_PER_BATCH });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
+app.post('/collect', requireAuth, async (req, res) => {
+  try {
+    const user = (await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id])).rows[0];
+    const creditsToAdd = CREDIT_TIERS[user.current_streak];
+    if (!creditsToAdd) return res.status(400).json({ error: 'Nothing to collect' });
+    const batchAdsUsed = user.current_batch === 1 ? user.batch1_ads_used : user.batch2_ads_used;
+    const batchDone = batchAdsUsed >= MAX_ADS_PER_BATCH;
+    const isJackpot = user.current_streak === MAX_ADS_PER_BATCH;
+    let cooldownUntil = null, newBatch = user.current_batch;
+    if (batchDone || isJackpot) {
+      cooldownUntil = new Date(Date.now() + BATCH_COOLDOWN_MINUTES * 60 * 1000);
+      if (user.current_batch === 1) newBatch = 2;
+    }
+    await pool.query(`UPDATE users SET credits = credits + $1, current_streak = 0, batch_cooldown_until = $2, current_batch = $3 WHERE id = $4`,
+      [creditsToAdd, cooldownUntil, newBatch, req.user.id]);
+    res.json({ creditsAdded: creditsToAdd, isJackpot, cooldownUntil });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/watch-watermark-ad', requireAuth, async (req, res) => {
+  try {
+    const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await pool.query('UPDATE users SET watermark_removed_until = $1 WHERE id = $2', [until, req.user.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/watch-hd-ad', requireAuth, async (req, res) => {
+  try {
+    const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await pool.query('UPDATE users SET hd_removed_until = $1 WHERE id = $2', [until, req.user.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/cancel-export', requireAuth, async (req, res) => {
+  try {
+    const exportData = activeExports.get(req.user.id);
+    if (!exportData) return res.json({ success: false, message: 'No active export found' });
+    exportData.cancelled = true;
+    try { exportData.proc.kill('SIGKILL'); } catch(e) {}
+    cleanupFiles(exportData.tmpFiles);
+    activeExports.delete(req.user.id);
+    res.json({ success: true, message: 'Export cancelled. Credits are non-refundable.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/export', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 20 }]), async (req, res) => {
+  const tmpFiles = [];
+  try {
+    const { fps = 1, repeatCount = 1, durationSeconds, fadeIn = 'false', fadeOut = 'false', fitMode = 'original' } = req.body;
+
+    const durSecs = Math.min(parseInt(durationSeconds) || 3600, 43200);
+    const doFadeIn = fadeIn === 'true';
+    const doFadeOut = fadeOut === 'true';
+    const baseCost = getCreditsForDuration(durSecs);
+    const fadeCost = (doFadeIn ? 5 : 0) + (doFadeOut ? 5 : 0);
+    const totalCost = baseCost + fadeCost;
+
+    const user = (await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id])).rows[0];
+    if (user.credits < totalCost) return res.status(400).json({ error: `Not enough credits. Need ${totalCost}, have ${user.credits}` });
+    if (!req.files.image || !req.files.audio) return res.status(400).json({ error: 'Image and audio required' });
+    if (activeExports.has(req.user.id)) return res.status(400).json({ error: 'You already have an export in progress' });
+
+    const imageFile = req.files.image[0];
+    const audioFiles = req.files.audio;
+    tmpFiles.push(imageFile.path);
+    audioFiles.forEach(f => tmpFiles.push(f.path));
+
+    // Deduct credits immediately — non-refundable
+    await pool.query('UPDATE users SET credits = credits - $1 WHERE id = $2', [totalCost, req.user.id]);
+
+    const now = new Date();
+    const watermarkActive = !user.watermark_removed_until || new Date(user.watermark_removed_until) <= now;
+    const hdActive = !user.hd_removed_until || new Date(user.hd_removed_until) <= now;
+    const width = hdActive ? 1280 : 1920;
+    const height = hdActive ? 720 : 1080;
+
+    // Process image fit
+    const processedImage = path.join(os.tmpdir(), `proc_${Date.now()}.jpg`);
+    tmpFiles.push(processedImage);
+
+    let scaleFilter;
+    if (fitMode === 'crop') {
+      scaleFilter = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`;
+    } else if (fitMode === 'stretch') {
+      scaleFilter = `scale=${width}:${height}`;
+    } else if (fitMode === 'blur') {
+      const blurredBg = path.join(os.tmpdir(), `blur_${Date.now()}.jpg`);
+      tmpFiles.push(blurredBg);
+      await runFFmpeg(['-i', imageFile.path, '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=20`, '-y', blurredBg]);
+      await runFFmpeg(['-i', blurredBg, '-i', imageFile.path,
+        '-filter_complex', `[1:v]scale=${width}:${height}:force_original_aspect_ratio=decrease[fg];[0:v][fg]overlay=(W-w)/2:(H-h)/2`,
+        '-y', processedImage]);
+      scaleFilter = null;
+    } else {
+      scaleFilter = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`;
+    }
+    if (scaleFilter) await runFFmpeg(['-i', imageFile.path, '-vf', scaleFilter, '-y', processedImage]);
+
+    // Apply watermark
+    let finalImagePath = processedImage;
+    if (watermarkActive) {
+      const wmPath = path.join(os.tmpdir(), `wm_${Date.now()}.jpg`);
+      tmpFiles.push(wmPath);
+      await runFFmpeg(['-i', processedImage,
+        '-vf', `drawbox=x=0:y=0:w=iw:h=ih/12:color=black@1.0:t=fill,drawtext=text='Uploaded to youtube with loopmixvideo.com':fontcolor=white:fontsize=h/18:x=(w-text_w)/2:y=(ih/12-text_h)/2`,
+        '-y', wmPath]);
+      finalImagePath = wmPath;
+    }
+
+    // Concat audio
+    const concatPath = path.join(os.tmpdir(), `concat_${Date.now()}.txt`);
+    tmpFiles.push(concatPath);
+    let concatContent = '';
+    for (let r = 0; r < parseInt(repeatCount); r++) {
+      for (const af of audioFiles) concatContent += `file '${af.path}'\n`;
+    }
+    fs.writeFileSync(concatPath, concatContent);
+
+    const mergedAudio = path.join(os.tmpdir(), `merged_${Date.now()}.aac`);
+    tmpFiles.push(mergedAudio);
+    await runFFmpeg(['-f', 'concat', '-safe', '0', '-i', concatPath, '-c:a', 'aac', '-b:a', '192k', '-vn', mergedAudio]);
+
+    const outputFile = path.join(os.tmpdir(), `output_${Date.now()}.mp4`);
+    tmpFiles.push(outputFile);
+    const fpsVal = doFadeIn || doFadeOut ? 24 : 1;
+
+    let vf = 'format=yuv420p';
+    if (doFadeIn) vf += ',fade=t=in:st=0:d=3';
+    if (doFadeOut) vf += `,fade=t=out:st=${durSecs - 3}:d=3`;
+
+    // Start the main FFmpeg process
+    const ffmpegArgs = [
+      '-loop', '1', '-framerate', String(fpsVal), '-i', finalImagePath,
+      '-i', mergedAudio,
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-tune', 'stillimage',
+      '-vf', vf,
+      '-c:a', 'aac', '-b:a', '192k',
+      '-t', String(durSecs),
+      '-movflags', '+faststart', '-y', outputFile
+    ];
+
+    const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
+    const exportData = { proc: ffmpegProc, outputFile, tmpFiles, cancelled: false };
+    activeExports.set(req.user.id, exportData);
+
+    await new Promise((resolve, reject) => {
+      let stderr = '';
+      ffmpegProc.stderr.on('data', d => stderr += d.toString());
+      ffmpegProc.on('close', code => {
+        if (exportData.cancelled) { reject(new Error('CANCELLED')); return; }
+        if (code === 0) resolve();
+        else reject(new Error('FFmpeg: ' + stderr.slice(-500)));
+      });
+    });
+
+    activeExports.delete(req.user.id);
+
+    // Send file, then delete after 30 seconds
+    res.download(outputFile, (req.body.fileName || 'loopmixvideo') + '.mp4', (err) => {
+      setTimeout(() => cleanupFiles(tmpFiles), 30000);
+    });
+
+  } catch (e) {
+    activeExports.delete(req.user.id);
+    cleanupFiles(tmpFiles);
+    if (e.message === 'CANCELLED') {
+      res.status(499).json({ error: 'Export was cancelled' });
+    } else {
+      res.status(500).json({ error: e.message });
+    }
+  }
+});
+
+function runFFmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffmpeg', args);
+    let stderr = '';
+    proc.stderr.on('data', d => stderr += d.toString());
+    proc.on('close', code => { if (code === 0) resolve(); else reject(new Error('FFmpeg: ' + stderr.slice(-500))); });
+  });
+}
+
+app.get('/', requireAuth, async (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Dashboard — StreamForCheap</title>
+<title>LoopmixVideo</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0;}
-:root{--bg:#0a0a0a;--surface:#111;--surface2:#1a1a1a;--border:rgba(255,255,255,0.08);--accent:#aaff00;--muted:#888;}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:#fff;min-height:100vh;}
-a{text-decoration:none;color:inherit;}
-.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 2rem;height:64px;display:flex;align-items:center;justify-content:space-between;position:fixed;top:0;left:0;right:0;z-index:100;}
-.logo{font-size:18px;font-weight:800;}.logo .g{color:var(--accent);}
-.topbar-right{display:flex;align-items:center;gap:16px;}
-.plan-badge{background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);color:var(--accent);font-size:12px;font-weight:700;padding:4px 12px;border-radius:99px;text-transform:uppercase;}
-.logout{font-size:13px;color:var(--muted);}.logout:hover{color:#f87171;}
-.main{max-width:900px;margin:0 auto;padding:84px 1rem 4rem;}
-.welcome-banner{background:rgba(170,255,0,0.08);border:1px solid rgba(170,255,0,0.2);border-radius:12px;padding:1rem 1.5rem;margin-bottom:1.5rem;font-size:15px;color:var(--accent);display:${welcome?'block':'none'};}
-.page-title{font-size:26px;font-weight:800;margin-bottom:4px;letter-spacing:-0.5px;}
-.page-sub{font-size:14px;color:var(--muted);margin-bottom:2rem;}
-.upgrade-banner{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:2rem;text-align:center;margin-bottom:1.5rem;}
-.upgrade-banner h3{font-size:18px;font-weight:700;margin-bottom:8px;}
-.upgrade-banner p{font-size:14px;color:var(--muted);margin-bottom:1.5rem;}
-.upgrade-btn{background:var(--accent);color:#000;border:none;border-radius:8px;padding:12px 24px;font-size:15px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block;}
-.streams-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
-.streams-header h2{font-size:16px;font-weight:700;}
-.slots-info{font-size:13px;color:var(--muted);font-weight:400;}
-.add-btn{background:var(--accent);color:#000;border:none;border-radius:8px;padding:9px 18px;font-size:14px;font-weight:700;cursor:pointer;transition:opacity 0.15s;}
-.add-btn:hover{opacity:0.85;}.add-btn:disabled{opacity:0.4;cursor:not-allowed;}
-.stream-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin-bottom:12px;}
-.stream-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:10px;}
-.stream-name{font-size:17px;font-weight:700;}
-.stream-status{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;}
-.status-dot{width:8px;height:8px;border-radius:50%;}
-.status-live{color:var(--accent);}.status-live .status-dot{background:var(--accent);animation:pulse 1.5s infinite;}
-.status-stopped{color:var(--muted);}.status-stopped .status-dot{background:#444;}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
-.stream-body{display:flex;gap:16px;margin-bottom:1rem;align-items:flex-start;flex-wrap:wrap;}
-.stream-thumb{width:120px;height:68px;border-radius:8px;object-fit:cover;background:#000;flex-shrink:0;border:1px solid #222;}
-.stream-thumb-placeholder{width:120px;height:68px;border-radius:8px;background:#1a1a1a;border:1px solid #222;display:flex;align-items:center;justify-content:center;font-size:28px;flex-shrink:0;}
-.stream-info{display:flex;flex-direction:column;gap:6px;flex:1;}
-.stream-info-item{font-size:13px;color:var(--muted);}
-.stream-info-item strong{color:#ccc;}
-.stream-actions{display:flex;gap:8px;flex-wrap:wrap;}
-.btn-start{background:var(--accent);color:#000;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;transition:opacity 0.15s;}
-.btn-start:hover:not(:disabled){opacity:0.85;}.btn-start:disabled{opacity:0.4;cursor:not-allowed;}
-.btn-stop{background:rgba(248,113,113,0.1);color:#f87171;border:1px solid rgba(248,113,113,0.3);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;}
-.btn-stop:hover{background:rgba(248,113,113,0.2);}
-.btn-edit{background:var(--surface2);color:#aaa;border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.15s;}
-.btn-edit:hover{border-color:var(--accent);color:var(--accent);}
-.btn-delete{background:transparent;color:#555;border:1px solid #222;border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;transition:all 0.15s;}
-.btn-delete:hover{color:#f87171;border-color:#f87171;}
-.empty-state{text-align:center;padding:4rem 2rem;background:var(--surface);border:1px dashed #222;border-radius:14px;}
-.empty-icon{font-size:48px;margin-bottom:1rem;}
-.empty-state h3{font-size:18px;font-weight:700;margin-bottom:8px;}
-.empty-state p{font-size:14px;color:var(--muted);margin-bottom:1.5rem;}
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:200;display:none;align-items:flex-start;justify-content:center;padding:2rem 1rem;overflow-y:auto;}
-.modal-overlay.open{display:flex;}
-.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:2rem;max-width:540px;width:100%;margin:auto;}
-.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;}
-.modal-header h2{font-size:20px;font-weight:800;}
-.modal-close{background:none;border:none;color:#555;font-size:22px;cursor:pointer;}.modal-close:hover{color:#fff;}
-.field{margin-bottom:16px;}.field label{font-size:13px;color:var(--muted);display:block;margin-bottom:6px;}
-.field input,.field select{width:100%;padding:11px 14px;background:var(--surface2);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;font-size:14px;outline:none;transition:border-color 0.15s;font-family:inherit;}
-.field input:focus,.field select:focus{border-color:var(--accent);}
-.field select option{background:#1a1a1a;}
-.field-note{font-size:11px;color:#555;margin-top:5px;line-height:1.5;}
-.section-divider{border:none;border-top:1px solid var(--border);margin:20px 0;}
-.section-heading{font-size:13px;font-weight:700;color:#aaa;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:14px;}
-.preview-wrap{position:relative;width:100%;aspect-ratio:16/9;border-radius:10px;overflow:hidden;background:#000;border:1px solid #222;margin-bottom:10px;cursor:pointer;}
-.preview-wrap img{width:100%;height:100%;object-fit:cover;}
-.preview-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);opacity:0;transition:opacity 0.15s;}
-.preview-wrap:hover .preview-overlay{opacity:1;}
-.preview-overlay-text{color:#fff;font-size:14px;font-weight:600;}
-.preview-overlay-icon{font-size:28px;margin-bottom:6px;}
-.preview-empty{width:100%;aspect-ratio:16/9;border-radius:10px;border:1.5px dashed #2a2a2a;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;position:relative;transition:all 0.15s;margin-bottom:10px;background:transparent;}
-.preview-empty:hover{border-color:var(--accent);background:rgba(170,255,0,0.03);}
-.preview-empty-icon{font-size:32px;color:var(--accent);margin-bottom:8px;}
-.preview-empty-text{font-size:13px;color:#555;}
-.hidden-file{position:fixed;left:-9999px;opacity:0;width:0;height:0;}
-.volume-row{display:flex;align-items:center;gap:12px;margin-top:10px;}
-.volume-row label{font-size:12px;color:var(--muted);width:90px;flex-shrink:0;}
-.volume-row input[type=range]{flex:1;-webkit-appearance:none;height:4px;border-radius:99px;background:#2a2a2a;outline:none;cursor:pointer;}
-.volume-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer;}
-.vol-val{font-size:13px;font-weight:700;color:var(--accent);width:38px;text-align:right;flex-shrink:0;}
-.mute-btn{padding:5px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid #333;background:transparent;color:#666;transition:all 0.15s;flex-shrink:0;}
-.mute-btn.muted{background:rgba(248,113,113,0.1);border-color:rgba(248,113,113,0.3);color:#f87171;}
-.mute-btn:hover{border-color:var(--accent);color:var(--accent);}
-.audio-tracks-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px;}
-.audio-track-item{display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid #222;border-radius:8px;padding:8px 12px;}
-.track-order-btns{display:flex;flex-direction:column;gap:2px;}
-.track-order-btn{background:none;border:none;color:#555;cursor:pointer;font-size:10px;line-height:1;padding:1px 4px;transition:color 0.1s;}
-.track-order-btn:hover{color:var(--accent);}
-.track-name-text{flex:1;font-size:13px;color:#ccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.track-dur-text{font-size:12px;color:#555;flex-shrink:0;}
-.track-remove-btn{background:none;border:none;color:#444;cursor:pointer;font-size:16px;padding:0 2px;transition:color 0.1s;}
-.track-remove-btn:hover{color:#f87171;}
-.add-audio-btn{width:100%;padding:10px;background:transparent;border:1.5px dashed #2a2a2a;border-radius:8px;color:#555;font-size:13px;cursor:pointer;position:relative;transition:all 0.15s;}
-.add-audio-btn:hover{border-color:var(--accent);color:var(--accent);}
-.add-audio-btn input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;}
-.progress-wrap{margin-top:12px;display:none;}
-.progress-track{height:4px;background:#222;border-radius:99px;overflow:hidden;}
-.progress-fill{height:100%;background:var(--accent);border-radius:99px;width:0%;transition:width 0.3s;}
-.progress-label{font-size:12px;color:var(--muted);margin-top:6px;}
-.error-box{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:#f87171;padding:10px 14px;border-radius:8px;font-size:13px;margin-top:10px;display:none;}
-.modal-btn{width:100%;padding:13px;background:var(--accent);color:#000;font-size:15px;font-weight:700;border-radius:10px;border:none;cursor:pointer;transition:opacity 0.15s;margin-top:12px;}
-.modal-btn:hover{opacity:0.85;}.modal-btn:disabled{opacity:0.4;cursor:not-allowed;}
-.save-note{font-size:12px;color:#555;text-align:center;margin-top:8px;}
-.live-tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--accent);background:rgba(170,255,0,0.1);border:1px solid rgba(170,255,0,0.2);border-radius:99px;padding:2px 8px;margin-left:8px;vertical-align:middle;}
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #fff; min-height: 100vh; padding-top: 64px; }
+  .topbar { position: fixed; top: 0; left: 0; right: 0; background: #111; border-bottom: 1px solid #222; padding: 0 24px; height: 64px; display: flex; align-items: center; justify-content: space-between; z-index: 100; }
+  .topbar-logo { font-size: 22px; font-weight: 800; letter-spacing: -0.5px; }
+  .topbar-logo span { color: #fbbf24; }
+  .topbar-right { display: flex; align-items: center; gap: 14px; }
+  .credits-pill { display: flex; align-items: center; gap: 8px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 99px; padding: 8px 16px; }
+  .credits-pill .coin { font-size: 18px; }
+  .credits-pill .amount { font-size: 17px; font-weight: 700; color: #fbbf24; }
+  .watch-ads-btn { background: #fbbf24; color: #0f0f0f; border: none; border-radius: 99px; padding: 9px 18px; font-size: 14px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: opacity 0.15s; }
+  .watch-ads-btn:hover { opacity: 0.85; }
+  .user-avatar { width: 32px; height: 32px; border-radius: 50%; }
+  .logout { font-size: 13px; color: #555; text-decoration: none; }
+  .logout:hover { color: #f87171; }
+  .main { max-width: 900px; margin: 0 auto; padding: 2rem 1rem 5rem; }
+  .card { background: #1a1a1a; border: 1px solid #222; border-radius: 14px; padding: 1.5rem; margin-bottom: 12px; }
+  .section-label { font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #555; margin-bottom: 14px; }
+  .image-section { display: grid; grid-template-columns: 1fr 220px; gap: 16px; align-items: start; }
+  .yt-preview-label { font-size: 13px; color: #666; margin-bottom: 8px; }
+  .yt-thumbnail { width: 100%; aspect-ratio: 16/9; border-radius: 10px; overflow: hidden; background: #000; position: relative; }
+  .yt-thumbnail canvas { width: 100%; height: 100%; display: block; }
+  .upload-placeholder { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #333; font-size: 14px; gap: 8px; cursor: pointer; position: relative; aspect-ratio: 16/9; }
+  .upload-placeholder input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .upload-icon-big { font-size: 36px; color: #fbbf24; }
+  .yt-meta { margin-top: 10px; }
+  .yt-title-preview { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .yt-channel { font-size: 13px; color: #888; margin-bottom: 6px; }
+  .yt-stats { display: flex; align-items: center; gap: 12px; }
+  .yt-likes { display: flex; align-items: center; gap: 5px; background: #222; border-radius: 99px; padding: 4px 12px; font-size: 13px; color: #777; }
+  .fit-options { display: flex; flex-direction: column; gap: 8px; }
+  .fit-option { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; border: 1.5px solid #2a2a2a; cursor: pointer; transition: all 0.15s; background: transparent; }
+  .fit-option:hover { border-color: #fbbf24; }
+  .fit-option.active { border-color: #fbbf24; background: rgba(251,191,36,0.08); }
+  .fit-thumb { width: 52px; height: 30px; border-radius: 4px; overflow: hidden; background: #000; flex-shrink: 0; }
+  .fit-thumb canvas { width: 100%; height: 100%; display: block; }
+  .fit-label { font-size: 13px; color: #aaa; line-height: 1.3; }
+  .fit-option.active .fit-label { color: #fbbf24; }
+  .badge-row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  .badge { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 10px; font-size: 13px; font-weight: 500; flex: 1; min-width: 200px; }
+  .badge.wm-active { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: #f87171; }
+  .badge.wm-removed { background: rgba(74,222,128,0.1); border: 1px solid rgba(74,222,128,0.3); color: #4ade80; }
+  .badge.hd-active { background: #111; border: 1px solid #2a2a2a; color: #666; }
+  .badge.hd-unlocked { background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: #fbbf24; }
+  .badge-btn { margin-left: auto; background: #fbbf24; color: #0f0f0f; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; flex-shrink: 0; transition: opacity 0.15s; }
+  .badge-btn:hover:not(:disabled) { opacity: 0.85; }
+  .badge-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .badge-btn.danger { background: #f87171; }
+  .track-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .track-item { display: flex; align-items: center; gap: 12px; background: #222; border: 1px solid #333; border-radius: 10px; padding: 12px 16px; }
+  .track-icon { color: #fbbf24; font-size: 18px; flex-shrink: 0; }
+  .track-name { flex: 1; font-size: 15px; color: #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+  .track-dur { font-size: 13px; color: #666; flex-shrink: 0; }
+  .track-remove { color: #444; cursor: pointer; font-size: 20px; background: none; border: none; transition: color 0.1s; padding: 0 4px; }
+  .track-remove:hover { color: #f87171; }
+  .add-track { width: 100%; padding: 13px; background: transparent; border: 1.5px dashed #333; border-radius: 10px; color: #666; font-size: 15px; cursor: pointer; position: relative; transition: all 0.15s; font-weight: 500; }
+  .add-track:hover { border-color: #fbbf24; color: #fbbf24; }
+  .add-track input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+  .slider-input-row { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+  .slider-input-row label { font-size: 14px; color: #777; width: 130px; flex-shrink: 0; }
+  .slider-input-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 99px; background: #2a2a2a; outline: none; cursor: pointer; }
+  .slider-input-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #fbbf24; cursor: pointer; }
+  .slider-input-row input[type=text], .slider-input-row input[type=number] { width: 90px; padding: 9px 10px; background: #111; border: 1px solid #2a2a2a; border-radius: 8px; color: #fff; font-size: 15px; font-weight: 600; text-align: center; outline: none; transition: border-color 0.15s; flex-shrink: 0; }
+  .slider-input-row input:focus { border-color: #fbbf24; }
+  .fade-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .fade-btn { padding: 14px; border-radius: 10px; border: 1.5px solid #2a2a2a; background: transparent; color: #777; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; text-align: center; }
+  .fade-btn .cost { font-size: 12px; color: #555; margin-top: 4px; }
+  .fade-btn:hover { border-color: #fbbf24; color: #fbbf24; }
+  .fade-btn.active { background: rgba(251,191,36,0.1); border-color: #fbbf24; color: #fbbf24; }
+  .fade-btn.active .cost { color: #999; }
+  .credit-cost-box { background: #111; border: 1px solid #2a2a2a; border-radius: 10px; padding: 14px 16px; }
+  .credit-row { display: flex; align-items: center; justify-content: space-between; font-size: 14px; color: #666; margin-bottom: 8px; }
+  .credit-row:last-child { margin-bottom: 0; padding-top: 10px; border-top: 1px solid #222; font-size: 17px; font-weight: 700; color: #fff; }
+  .credit-row .val { color: #fbbf24; font-weight: 600; }
+  .not-enough-btn { background: #f87171; color: #0f0f0f; border: none; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 700; cursor: pointer; margin-left: 8px; }
+  .go-btn { width: 100%; padding: 17px; font-size: 17px; font-weight: 800; border-radius: 12px; border: none; background: #fbbf24; color: #0f0f0f; cursor: pointer; transition: opacity 0.15s; }
+  .go-btn:hover:not(:disabled) { opacity: 0.9; }
+  .go-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .cancel-btn { width: 100%; padding: 13px; font-size: 15px; font-weight: 700; border-radius: 12px; border: 1.5px solid #f87171; background: transparent; color: #f87171; cursor: pointer; transition: all 0.15s; margin-top: 8px; display: none; }
+  .cancel-btn:hover { background: rgba(248,113,113,0.1); }
+  .export-status { background: #111; border: 1px solid #222; border-radius: 10px; padding: 16px; margin-top: 12px; font-size: 14px; color: #777; display: none; }
+  .export-status.active { display: block; }
+  .export-note { font-size: 12px; color: #555; margin-top: 8px; }
+  .progress-track { height: 4px; background: #222; border-radius: 99px; overflow: hidden; margin-top: 12px; }
+  .progress-fill { height: 100%; background: #fbbf24; border-radius: 99px; width: 0%; transition: width 0.5s; }
+  .result-box { margin-top: 12px; padding: 14px; background: #0f1a0f; border: 1px solid #166534; border-radius: 10px; color: #4ade80; font-size: 14px; display: none; }
+  .error-box { margin-top: 12px; padding: 14px; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); border-radius: 10px; color: #f87171; font-size: 14px; display: none; }
+  .retry-btn { background: #fbbf24; color: #0f0f0f; border: none; border-radius: 8px; padding: 8px 16px; font-size: 14px; font-weight: 700; cursor: pointer; margin-top: 10px; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.88); z-index: 200; display: none; align-items: center; justify-content: center; padding: 1rem; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 16px; padding: 2rem; max-width: 440px; width: 100%; }
+  .modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }
+  .modal-header h2 { font-size: 20px; font-weight: 800; }
+  .modal-close { background: none; border: none; color: #555; font-size: 22px; cursor: pointer; }
+  .modal-close:hover { color: #fff; }
+  .streak-display { display: flex; justify-content: center; gap: 10px; margin-bottom: 1.5rem; }
+  .streak-dot { width: 34px; height: 34px; border-radius: 50%; background: #222; border: 2px solid #2a2a2a; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #555; transition: all 0.3s; }
+  .streak-dot.active { background: #fbbf24; border-color: #fbbf24; color: #0f0f0f; }
+  .streak-dot.done { background: #4ade80; border-color: #4ade80; color: #0f0f0f; }
+  .offer-box { background: #111; border: 1px solid #2a2a2a; border-radius: 10px; padding: 1.25rem; margin-bottom: 1rem; text-align: center; }
+  .offer-box .amount { font-size: 42px; font-weight: 800; color: #fbbf24; }
+  .offer-box .label { font-size: 14px; color: #666; margin-top: 4px; }
+  .modal-btn { width: 100%; padding: 14px; font-size: 15px; font-weight: 700; border-radius: 10px; border: none; cursor: pointer; transition: all 0.15s; margin-bottom: 8px; }
+  .btn-watch { background: #fbbf24; color: #0f0f0f; }
+  .btn-collect { background: #4ade80; color: #0f0f0f; }
+  .btn-secondary { background: #222; color: #888; }
+  .cooldown-box { background: #1a0f2e; border: 1px solid #4c1d95; border-radius: 10px; padding: 1.5rem; text-align: center; color: #a78bfa; margin-bottom: 1rem; }
+  .cooldown-timer { font-size: 36px; font-weight: 800; color: #a78bfa; margin: 10px 0; }
+  .daily-box { background: #0f1a0f; border: 1px solid #166534; border-radius: 10px; padding: 1.5rem; text-align: center; color: #4ade80; margin-bottom: 1rem; }
+  .slots-info { font-size: 13px; color: #555; text-align: center; margin-top: 6px; }
+  #confetti-container { position: fixed; inset: 0; pointer-events: none; z-index: 999; }
+  .confetti-piece { position: absolute; border-radius: 2px; animation: fall 3s ease-in forwards; }
+  @keyframes fall { 0%{transform:translateY(-20px) rotate(0deg);opacity:1} 100%{transform:translateY(100vh) rotate(720deg);opacity:0} }
 </style>
 </head>
 <body>
+
 <div class="topbar">
-  <a href="/" class="logo">stream<span class="g">forcheap</span></a>
+  <div class="topbar-logo">Loop<span>mix</span>Video</div>
   <div class="topbar-right">
-    <span class="plan-badge">${user.plan}</span>
-    <a href="/logout" class="logout">Log out</a>
+    <div class="credits-pill">
+      <span class="coin">🪙</span>
+      <span class="amount" id="credits-display">...</span>
+    </div>
+    <button class="watch-ads-btn" onclick="openAdModal()">🎰 Watch Ads — up to 190 credits</button>
+    <img class="user-avatar" id="user-avatar" src="" alt="" />
+    <a href="/logout" class="logout">Sign out</a>
   </div>
 </div>
 
-<input type="file" id="hidden-video-input" class="hidden-file" accept=".mp4,.mov,.avi,.mkv,.webm,.gif,.jpg,.jpeg,.png,.webp" onchange="handleVideoSelect(event)"/>
+<div id="confetti-container"></div>
 
-<div class="modal-overlay" id="stream-modal">
+<div class="modal-overlay" id="ad-modal">
   <div class="modal">
     <div class="modal-header">
-      <h2 id="modal-title">Add stream</h2>
-      <button class="modal-close" onclick="closeModal()">✕</button>
+      <h2>🎰 Earn Credits</h2>
+      <button class="modal-close" onclick="closeAdModal()">✕</button>
     </div>
-    <div class="field"><label>Stream name</label><input type="text" id="stream-name" placeholder="My Lofi Stream"/></div>
-    <div class="field">
-      <label>YouTube Stream Key</label>
-      <input type="password" id="stream-key" placeholder="xxxx-xxxx-xxxx-xxxx-xxxx"/>
-      <div class="field-note">YouTube Studio → Go Live → Stream. Keep it private.</div>
-    </div>
-    <div class="field">
-      <label>Resolution</label>
-      <select id="stream-res"><option value="720p">720p</option><option value="1080p" selected>1080p</option></select>
-    </div>
-    <hr class="section-divider"/>
-    <div class="section-heading">🎬 Video / Image</div>
-    <div id="preview-container"></div>
-    <div class="volume-row">
-      <label>Video volume</label>
-      <input type="range" id="video-vol" min="0" max="100" value="100" oninput="onVolChange('video')"/>
-      <span class="vol-val" id="video-vol-val">100%</span>
-      <button class="mute-btn" id="video-mute-btn" onclick="toggleMute('video')">Mute</button>
-    </div>
-    <hr class="section-divider"/>
-    <div class="section-heading">🎵 Audio Tracks <span style="font-size:11px;color:#555;font-weight:400;text-transform:none;letter-spacing:0;">(loop forever)</span></div>
-    <div class="audio-tracks-list" id="audio-tracks-list"></div>
-    <button class="add-audio-btn">
-      <input type="file" id="audio-file-input" accept=".mp3,.wav,.aac,.ogg,.flac,.m4a" multiple onchange="handleAudioAdd(event)"/>
-      + Add audio track
-    </button>
-    <div class="volume-row" style="margin-top:12px;">
-      <label>Audio volume</label>
-      <input type="range" id="audio-vol" min="0" max="100" value="100" oninput="onVolChange('audio')"/>
-      <span class="vol-val" id="audio-vol-val">100%</span>
-      <button class="mute-btn" id="audio-mute-btn" onclick="toggleMute('audio')">Mute</button>
-    </div>
-    <div class="progress-wrap" id="upload-progress">
-      <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
-      <div class="progress-label" id="progress-label">Uploading...</div>
-    </div>
-    <div class="error-box" id="modal-error"></div>
-    <button class="modal-btn" id="save-btn" onclick="saveStream()">Save stream</button>
-    <div class="save-note" id="save-note"></div>
+    <div class="streak-display" id="streak-dots"></div>
+    <div id="ad-content">Loading...</div>
   </div>
 </div>
 
 <div class="main">
-  ${welcome?`<div class="welcome-banner">🎉 Welcome! Your subscription is active. Add your first stream below to get started.</div>`:''}
-  <div class="page-title">Your Streams</div>
-  <div class="page-sub">${user.email} · ${user.plan} plan</div>
 
-  ${!hasActivePlan?`
-  <div class="upgrade-banner">
-    <h3>No active subscription</h3>
-    <p>Choose a plan to start streaming 24/7 to YouTube.</p>
-    <a href="/#pricing" class="upgrade-btn">View plans →</a>
-  </div>
-  `:`
-  <div class="streams-header">
-    <h2>Streams <span class="slots-info">(${streams.length}/${maxSlots} slots used)</span></h2>
-    <button class="add-btn" ${streams.length>=maxSlots?'disabled':''} onclick="openModal()">+ Add stream</button>
-  </div>
-  <div id="streams-list">
-    ${streams.length===0?`
-    <div class="empty-state">
-      <div class="empty-icon">📡</div>
-      <h3>No streams yet</h3>
-      <p>Add your first stream to get started. It only takes a minute.</p>
-      <button class="add-btn" onclick="openModal()">+ Add your first stream</button>
-    </div>`:streams.map(s=>{
-      const isLive = activeStreams.has(s.id);
-      const tracks = Array.isArray(s.audio_tracks) ? s.audio_tracks : [];
-      const thumbHtml = s.thumb_path
-        ? `<img class="stream-thumb" src="${s.thumb_path}" alt="thumb"/>`
-        : `<div class="stream-thumb-placeholder">📡</div>`;
-      return `<div class="stream-card" id="stream-${s.id}">
-        <div class="stream-top">
-          <div class="stream-name">${s.name}</div>
-          <div class="stream-status ${isLive?'status-live':'status-stopped'}">
-            <div class="status-dot"></div>${isLive?'🔴 LIVE':'Stopped'}
+  <div class="card">
+    <div class="section-label">Background Image</div>
+    <div class="image-section">
+      <div>
+        <div class="yt-preview-label">Your Video Preview</div>
+        <div class="yt-thumbnail">
+          <div class="upload-placeholder" id="upload-placeholder">
+            <input type="file" id="img-input" accept="image/*" onchange="handleImage(event)" />
+            <span class="upload-icon-big">🖼</span>
+            <span style="color:#555;font-size:14px;">Click to upload image</span>
+          </div>
+          <canvas id="preview-canvas" style="display:none;width:100%;height:100%;"></canvas>
+        </div>
+        <div class="yt-meta">
+          <div class="yt-title-preview" id="yt-title-preview">Your Video Title</div>
+          <div class="yt-channel">Your Channel • 1,000,000 views</div>
+          <div class="yt-stats">
+            <div class="yt-likes">👍 48K</div>
+            <div class="yt-likes">👎</div>
           </div>
         </div>
-        <div class="stream-body">
-          ${thumbHtml}
-          <div class="stream-info">
-            <div class="stream-info-item"><strong>File:</strong> ${s.file_name||'No file uploaded'}</div>
-            <div class="stream-info-item"><strong>Audio tracks:</strong> ${tracks.length}</div>
-            <div class="stream-info-item"><strong>Resolution:</strong> ${s.resolution}</div>
-            <div class="stream-info-item"><strong>Stream key:</strong> ${s.stream_key?'••••••••':'Not set'}</div>
-          </div>
+      </div>
+      <div class="fit-options">
+        <div style="font-size:12px;color:#555;margin-bottom:6px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;">Fit options</div>
+        <div class="fit-option active" id="fit-original" onclick="selectFit('original')">
+          <div class="fit-thumb"><canvas id="thumb-original"></canvas></div>
+          <div class="fit-label">Original<br><span style="color:#555;font-size:11px;">Black bars</span></div>
         </div>
-        <div class="stream-actions">
-          ${!isLive?`<button class="btn-start" onclick="startStream(${s.id})" ${!s.file_path||!s.stream_key?'disabled':''}>${!s.file_path||!s.stream_key?'⚠ Missing file or key':'▶ Start stream'}</button>`:''}
-          ${isLive?`<button class="btn-stop" onclick="stopStream(${s.id})">⬛ Stop stream</button>`:''}
-          <button class="btn-edit" onclick="editStream(${s.id})">✏️ Edit</button>
-          <button class="btn-delete" onclick="deleteStream(${s.id})">🗑 Delete</button>
+        <div class="fit-option" id="fit-crop" onclick="selectFit('crop')">
+          <div class="fit-thumb"><canvas id="thumb-crop"></canvas></div>
+          <div class="fit-label">Crop<br><span style="color:#555;font-size:11px;">Zoom, cut edges</span></div>
         </div>
-      </div>`;
-    }).join('')}
+        <div class="fit-option" id="fit-stretch" onclick="selectFit('stretch')">
+          <div class="fit-thumb"><canvas id="thumb-stretch"></canvas></div>
+          <div class="fit-label">Stretch<br><span style="color:#555;font-size:11px;">Distort to fill</span></div>
+        </div>
+        <div class="fit-option" id="fit-blur" onclick="selectFit('blur')">
+          <div class="fit-thumb"><canvas id="thumb-blur"></canvas></div>
+          <div class="fit-label">Blur fill<br><span style="color:#555;font-size:11px;">Blurred background</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="badge-row">
+      <div class="badge wm-active" id="wm-badge">
+        <span id="wm-text">⚠️ Watermark active</span>
+        <button class="badge-btn danger" id="wm-btn" onclick="watchWatermarkAd()">Watch 1 ad to remove</button>
+      </div>
+      <div class="badge hd-active" id="hd-badge">
+        <span id="hd-text">📺 720p — Free</span>
+        <button class="badge-btn" id="hd-btn" onclick="watchHdAd()">1080p for 24hrs — Watch 1 ad</button>
+      </div>
+    </div>
   </div>
-  `}
+
+  <div class="card">
+    <div class="section-label">Audio Tracks</div>
+    <div class="track-list" id="track-list">
+      <div style="font-size:15px;color:#555;text-align:center;padding:12px">No tracks added yet</div>
+    </div>
+    <button class="add-track">
+      <input type="file" id="audio-input" accept="audio/*" multiple onchange="handleAudio(event)" />
+      + Add audio track
+    </button>
+  </div>
+
+  <div class="card" id="fps-section" style="display:none">
+    <div class="section-label">Frames Per Second</div>
+    <div class="slider-input-row">
+      <label>FPS</label>
+      <input type="range" id="fps-slider" min="1" max="30" value="1" oninput="onFpsSlider(this.value)" />
+      <input type="number" id="fps-input" value="1" min="1" max="30" oninput="onFpsInput(this.value)" />
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-label">Loop &amp; Duration</div>
+    <div class="slider-input-row">
+      <label>Loop count</label>
+      <input type="range" id="loop-slider" min="1" max="200" value="1" oninput="onLoopSlider(this.value)" />
+      <input type="number" id="loop-input" value="1" min="1" max="999" oninput="onLoopInput(this.value)" />
+    </div>
+    <div class="slider-input-row">
+      <label>Duration</label>
+      <input type="range" id="dur-slider" min="1" max="720" value="60" oninput="onDurSlider(this.value)" />
+      <input type="text" id="dur-input" value="1:00:00" oninput="onDurText(this.value)" onblur="formatDurInput()" />
+    </div>
+    <div class="section-label" style="margin-top:16px;">Fade Effects</div>
+    <div class="fade-grid">
+      <button class="fade-btn" id="fade-in-btn" onclick="toggleFade('in')">▶ Fade In<div class="cost">+5 credits · 3 sec from black</div></button>
+      <button class="fade-btn" id="fade-out-btn" onclick="toggleFade('out')">Fade Out ◀<div class="cost">+5 credits · 3 sec to black</div></button>
+    </div>
+    <div class="credit-cost-box">
+      <div class="credit-row"><span>Duration cost</span><span class="val" id="cost-duration">20 credits</span></div>
+      <div class="credit-row" id="cost-fadein-row" style="display:none"><span>Fade in</span><span class="val">+5 credits</span></div>
+      <div class="credit-row" id="cost-fadeout-row" style="display:none"><span>Fade out</span><span class="val">+5 credits</span></div>
+      <div class="credit-row"><span>Total</span><span class="val" id="cost-total">20 credits</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-label">Export</div>
+    <div style="font-size:13px;color:#555;margin-bottom:12px;">⚠️ Credits are deducted immediately when export starts and are non-refundable if cancelled. Your video will auto-download when ready and be deleted from our servers within 30 seconds.</div>
+    <button class="go-btn" id="go-btn" onclick="startExport()">Export &amp; Download MP4</button>
+    <button class="cancel-btn" id="cancel-btn" onclick="cancelExport()">✕ Cancel Export (credits non-refundable)</button>
+    <div class="export-status" id="export-status">
+      <div id="export-msg">Preparing...</div>
+      <div class="progress-track"><div class="progress-fill" id="export-progress"></div></div>
+    </div>
+    <div class="result-box" id="result-box"></div>
+    <div class="error-box" id="error-box">
+      <div id="error-msg"></div>
+      <button class="retry-btn" onclick="startExport()">Try Again</button>
+    </div>
+  </div>
+
 </div>
 
 <script>
-let editingStreamId=null,selectedVideoFile=null,audioFiles=[],audioDurations=[],videoMuted=false,audioMuted=false,volDebounce=null;
-const liveMap=${JSON.stringify(liveMap)};
-const allStreams=${JSON.stringify(streams.reduce((a,s)=>{a[s.id]=s;return a;},{}))};
+let state = null;
+let audioFiles = [], audioDurations = [];
+let fadeInActive = false, fadeOutActive = false;
+let isImageFile = false;
+let fitMode = 'original';
+let uploadedImage = null;
+let isExporting = false;
+const TIERS = [0,10,25,45,75,125,190];
+const COLORS = ['#f87171','#fb923c','#facc15','#fbbf24','#34d399','#22d3ee','#818cf8'];
+const DURATION_CREDITS = [
+  {maxSeconds:600,credits:5},{maxSeconds:1800,credits:10},{maxSeconds:3600,credits:20},
+  {maxSeconds:10800,credits:40},{maxSeconds:21600,credits:75},{maxSeconds:32400,credits:125},{maxSeconds:43200,credits:170}
+];
 
-function setPreviewEmpty(){document.getElementById('preview-container').innerHTML=\`<div class="preview-empty" onclick="document.getElementById('hidden-video-input').click()"><span class="preview-empty-icon">🎬</span><span class="preview-empty-text">Click to upload video, image, or GIF</span><span style="font-size:11px;color:#444;margin-top:4px;">MP4, MOV, GIF, JPG, PNG — up to 20GB</span></div>\`;}
-function setPreviewImage(src,name){document.getElementById('preview-container').innerHTML=\`<div class="preview-wrap" onclick="document.getElementById('hidden-video-input').click()"><img src="\${src}" alt="preview"/><div class="preview-overlay"><div class="preview-overlay-icon">🔄</div><div class="preview-overlay-text">Click to change</div><div style="font-size:11px;color:#ccc;margin-top:4px;">\${name||''}</div></div></div>\`;}
+function getCreditsForSecs(s) {
+  for (const d of DURATION_CREDITS) { if (s <= d.maxSeconds) return d.credits; }
+  return 170;
+}
+function parseDur(val) {
+  val = String(val).trim();
+  const parts = val.split(':').map(p => parseInt(p)||0);
+  if (parts.length === 3) return parts[0]*3600+parts[1]*60+parts[2];
+  if (parts.length === 2) return parts[0]*3600+parts[1]*60;
+  return (parseInt(val)||0)*60;
+}
+function secsToHMS(s) {
+  s = Math.max(60, Math.min(s, 43200));
+  return Math.floor(s/3600)+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+}
+function getTotalAudioSecs() { return audioDurations.reduce((a,b)=>a+b,0); }
 
-function openModal(){
-  editingStreamId=null;selectedVideoFile=null;audioFiles=[];audioDurations=[];videoMuted=false;audioMuted=false;
-  document.getElementById('modal-title').textContent='Add stream';
-  document.getElementById('stream-name').value='';document.getElementById('stream-key').value='';document.getElementById('stream-res').value='1080p';
-  document.getElementById('video-vol').value=100;document.getElementById('video-vol-val').textContent='100%';
-  document.getElementById('audio-vol').value=100;document.getElementById('audio-vol-val').textContent='100%';
-  document.getElementById('video-mute-btn').className='mute-btn';document.getElementById('audio-mute-btn').className='mute-btn';
-  document.getElementById('modal-error').style.display='none';document.getElementById('upload-progress').style.display='none';
-  document.getElementById('save-btn').disabled=false;document.getElementById('save-btn').textContent='Save stream';
-  document.getElementById('save-note').textContent='';
-  setPreviewEmpty();renderAudioTracks();
-  document.getElementById('stream-modal').classList.add('open');
+function onLoopSlider(v) { document.getElementById('loop-input').value=v; syncDurFromLoop(parseInt(v)); }
+function onLoopInput(v) { const l=Math.max(1,parseInt(v)||1); document.getElementById('loop-slider').value=Math.min(l,200); syncDurFromLoop(l); }
+function syncDurFromLoop(loops) {
+  const total = getTotalAudioSecs();
+  if (total > 0) { const s=Math.min(Math.round(total*loops),43200); document.getElementById('dur-input').value=secsToHMS(s); document.getElementById('dur-slider').value=Math.round(s/60); }
+  updateCreditCost();
+}
+function onDurSlider(v) { const s=parseInt(v)*60; document.getElementById('dur-input').value=secsToHMS(s); syncLoopFromDur(s); }
+function onDurText(v) { const s=parseDur(v); document.getElementById('dur-slider').value=Math.round(Math.min(s,43200)/60); syncLoopFromDur(s); }
+function formatDurInput() { document.getElementById('dur-input').value=secsToHMS(parseDur(document.getElementById('dur-input').value)); }
+function syncLoopFromDur(secs) {
+  const total = getTotalAudioSecs();
+  if (total > 0) { const l=Math.max(1,Math.round(secs/total)); document.getElementById('loop-input').value=l; document.getElementById('loop-slider').value=Math.min(l,200); }
+  updateCreditCost();
+}
+function onFpsSlider(v) { document.getElementById('fps-input').value=v; }
+function onFpsInput(v) { document.getElementById('fps-slider').value=Math.min(Math.max(parseInt(v)||1,1),30); }
+
+function toggleFade(type) {
+  if (type==='in') { fadeInActive=!fadeInActive; document.getElementById('fade-in-btn').classList.toggle('active',fadeInActive); document.getElementById('cost-fadein-row').style.display=fadeInActive?'flex':'none'; }
+  else { fadeOutActive=!fadeOutActive; document.getElementById('fade-out-btn').classList.toggle('active',fadeOutActive); document.getElementById('cost-fadeout-row').style.display=fadeOutActive?'flex':'none'; }
+  updateCreditCost();
 }
 
-function editStream(id){
-  editingStreamId=id;const s=allStreams[id];audioFiles=[];audioDurations=[];selectedVideoFile=null;
-  videoMuted=s.video_muted||false;audioMuted=s.audio_muted||false;
-  const isLive=liveMap[id]||false;
-  document.getElementById('modal-title').innerHTML='Edit stream'+(isLive?' <span class="live-tag">● LIVE</span>':'');
-  document.getElementById('stream-name').value=s.name||'';document.getElementById('stream-key').value=s.stream_key||'';document.getElementById('stream-res').value=s.resolution||'1080p';
-  document.getElementById('video-vol').value=s.video_volume||100;document.getElementById('video-vol-val').textContent=(s.video_volume||100)+'%';
-  document.getElementById('audio-vol').value=s.audio_volume||100;document.getElementById('audio-vol-val').textContent=(s.audio_volume||100)+'%';
-  document.getElementById('video-mute-btn').className='mute-btn'+(videoMuted?' muted':'');document.getElementById('audio-mute-btn').className='mute-btn'+(audioMuted?' muted':'');
-  document.getElementById('modal-error').style.display='none';document.getElementById('upload-progress').style.display='none';
-  document.getElementById('save-btn').disabled=false;document.getElementById('save-btn').textContent='Save changes';
-  document.getElementById('save-note').textContent=isLive?'Stream will restart briefly when you save':'';
-  if(s.thumb_path){setPreviewImage(s.thumb_path,s.file_name||'');}else{setPreviewEmpty();}
-  renderAudioTracks();document.getElementById('stream-modal').classList.add('open');
+function updateCreditCost() {
+  const secs = parseDur(document.getElementById('dur-input').value);
+  const base = getCreditsForSecs(secs);
+  const fade = (fadeInActive?5:0)+(fadeOutActive?5:0);
+  const total = base+fade;
+  document.getElementById('cost-duration').textContent = base+' credits';
+  const totalEl = document.getElementById('cost-total');
+  const hasEnough = state && state.credits >= total;
+  if (!hasEnough && state) {
+    totalEl.innerHTML = total+' credits <button class="not-enough-btn" onclick="openAdModal()">Not enough — watch ads</button>';
+  } else {
+    totalEl.textContent = total+' credits';
+  }
 }
 
-function closeModal(){document.getElementById('stream-modal').classList.remove('open');}
+function selectFit(mode) {
+  fitMode = mode;
+  document.querySelectorAll('.fit-option').forEach(el => el.classList.remove('active'));
+  document.getElementById('fit-'+mode).classList.add('active');
+  drawPreview();
+}
 
-function handleVideoSelect(e){
-  const file=e.target.files[0];if(!file)return;selectedVideoFile=file;
-  const ext=file.name.split('.').pop().toLowerCase();
-  if(['jpg','jpeg','png','webp'].includes(ext)){setPreviewImage(URL.createObjectURL(file),file.name);}
-  else{const v=document.createElement('video');v.src=URL.createObjectURL(file);v.muted=true;v.currentTime=0.5;v.onloadeddata=()=>{const c=document.createElement('canvas');c.width=320;c.height=180;c.getContext('2d').drawImage(v,0,0,320,180);setPreviewImage(c.toDataURL('image/jpeg'),file.name);};v.onerror=()=>setPreviewImage('',file.name);}
+function handleImage(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const ext = file.name.split('.').pop().toLowerCase();
+  isImageFile = ['jpg','jpeg','png','webp'].includes(ext);
+  document.getElementById('fps-section').style.display = isImageFile ? 'none' : 'block';
+  document.getElementById('upload-placeholder').style.display = 'none';
+  const canvas = document.getElementById('preview-canvas');
+  canvas.style.display = 'block';
+  const img = new Image();
+  img.onload = () => { uploadedImage = img; drawPreview(); drawThumbs(); };
+  img.src = URL.createObjectURL(file);
+}
+
+function drawPreview() {
+  if (!uploadedImage) return;
+  const canvas = document.getElementById('preview-canvas');
+  const W = canvas.offsetWidth || 560, H = Math.round(W * 9/16);
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H);
+  drawFit(ctx, uploadedImage, W, H, fitMode);
+}
+
+function drawFit(ctx, img, W, H, mode) {
+  const iw=img.width, ih=img.height;
+  if (mode==='crop') {
+    const scale=Math.max(W/iw,H/ih);
+    const sw=W/scale, sh=H/scale, sx=(iw-sw)/2, sy=(ih-sh)/2;
+    ctx.drawImage(img,sx,sy,sw,sh,0,0,W,H);
+  } else if (mode==='stretch') {
+    ctx.drawImage(img,0,0,W,H);
+  } else if (mode==='blur') {
+    const scale=Math.max(W/iw,H/ih);
+    const sw=W/scale, sh=H/scale, sx=(iw-sw)/2, sy=(ih-sh)/2;
+    ctx.filter='blur(20px)';
+    ctx.drawImage(img,sx,sy,sw,sh,-20,-20,W+40,H+40);
+    ctx.filter='none';
+    const scale2=Math.min(W/iw,H/ih);
+    const dw=iw*scale2, dh=ih*scale2;
+    ctx.drawImage(img,(W-dw)/2,(H-dh)/2,dw,dh);
+  } else {
+    const scale=Math.min(W/iw,H/ih);
+    const dw=iw*scale, dh=ih*scale;
+    ctx.drawImage(img,(W-dw)/2,(H-dh)/2,dw,dh);
+  }
+}
+
+function drawThumbs() {
+  if (!uploadedImage) return;
+  ['original','crop','stretch','blur'].forEach(mode => {
+    const canvas = document.getElementById('thumb-'+mode);
+    canvas.width=52; canvas.height=30;
+    const ctx=canvas.getContext('2d');
+    ctx.fillStyle='#000'; ctx.fillRect(0,0,52,30);
+    drawFit(ctx,uploadedImage,52,30,mode);
+  });
+}
+
+async function handleAudio(e) {
+  const files = Array.from(e.target.files);
+  for (const f of files) { const d=await getAudioDuration(f); audioFiles.push(f); audioDurations.push(d); }
+  renderTrackList();
+  if (getTotalAudioSecs()>0) syncDurFromLoop(parseInt(document.getElementById('loop-input').value)||1);
   e.target.value='';
 }
-
-function getAudioDuration(file){return new Promise(r=>{const a=new Audio();a.onloadedmetadata=()=>r(a.duration||0);a.onerror=()=>r(0);a.src=URL.createObjectURL(file);});}
-async function handleAudioAdd(e){for(const f of Array.from(e.target.files)){const d=await getAudioDuration(f);audioFiles.push(f);audioDurations.push(d);}renderAudioTracks();e.target.value='';}
-function removeAudioTrack(i){audioFiles.splice(i,1);audioDurations.splice(i,1);renderAudioTracks();}
-function moveTrack(i,dir){const ni=i+dir;if(ni<0||ni>=audioFiles.length)return;[audioFiles[i],audioFiles[ni]]=[audioFiles[ni],audioFiles[i]];[audioDurations[i],audioDurations[ni]]=[audioDurations[ni],audioDurations[i]];renderAudioTracks();}
-function renderAudioTracks(){
-  const list=document.getElementById('audio-tracks-list');
-  if(!audioFiles.length){list.innerHTML='';return;}
-  list.innerHTML=audioFiles.map((f,i)=>{const m=Math.floor(audioDurations[i]/60),s=Math.floor(audioDurations[i]%60);return \`<div class="audio-track-item"><div class="track-order-btns"><button class="track-order-btn" onclick="moveTrack(\${i},-1)" \${i===0?'disabled':''}>▲</button><button class="track-order-btn" onclick="moveTrack(\${i},1)" \${i===audioFiles.length-1?'disabled':''}>▼</button></div><span class="track-name-text">\${f.name}</span><span class="track-dur-text">\${m}:\${String(s).padStart(2,'0')}</span><button class="track-remove-btn" onclick="removeAudioTrack(\${i})">✕</button></div>\`;}).join('');
+function getAudioDuration(file) {
+  return new Promise(resolve => { const a=new Audio(); a.onloadedmetadata=()=>resolve(a.duration||0); a.onerror=()=>resolve(0); a.src=URL.createObjectURL(file); });
+}
+function removeTrack(i) { audioFiles.splice(i,1); audioDurations.splice(i,1); renderTrackList(); updateCreditCost(); }
+function renderTrackList() {
+  const list=document.getElementById('track-list');
+  if (audioFiles.length===0) { list.innerHTML='<div style="font-size:15px;color:#555;text-align:center;padding:12px">No tracks added yet</div>'; return; }
+  list.innerHTML='';
+  audioFiles.forEach((f,i) => {
+    const m=Math.floor(audioDurations[i]/60), s=Math.floor(audioDurations[i]%60);
+    const div=document.createElement('div'); div.className='track-item';
+    div.innerHTML='<span class="track-icon">♪</span><span class="track-name">'+f.name+'</span><span class="track-dur">'+m+':'+String(s).padStart(2,'0')+'</span><button class="track-remove" onclick="removeTrack('+i+')">✕</button>';
+    list.appendChild(div);
+  });
 }
 
-function onVolChange(type){
-  const val=parseInt(document.getElementById(type+'-vol').value);
-  document.getElementById(type+'-vol-val').textContent=val+'%';
-  if(type==='video'&&videoMuted&&val>0){videoMuted=false;document.getElementById('video-mute-btn').className='mute-btn';}
-  if(type==='audio'&&audioMuted&&val>0){audioMuted=false;document.getElementById('audio-mute-btn').className='mute-btn';}
-  if(editingStreamId&&liveMap[editingStreamId]){clearTimeout(volDebounce);volDebounce=setTimeout(async()=>{await saveMetaNow();await fetch('/api/streams/'+editingStreamId+'/restart',{method:'POST'});},500);}
+async function watchWatermarkAd() {
+  const btn=document.getElementById('wm-btn'); btn.textContent='⏳ Ad playing...'; btn.disabled=true;
+  await new Promise(r=>setTimeout(r,2000));
+  const res=await fetch('/watch-watermark-ad',{method:'POST'});
+  if ((await res.json()).success) await fetchState();
+  else { btn.textContent='Watch 1 ad to remove'; btn.disabled=false; }
 }
 
-function toggleMute(type){
-  if(type==='video'){videoMuted=!videoMuted;document.getElementById('video-mute-btn').className='mute-btn'+(videoMuted?' muted':'');document.getElementById('video-vol').value=videoMuted?0:100;document.getElementById('video-vol-val').textContent=videoMuted?'0%':'100%';}
-  else{audioMuted=!audioMuted;document.getElementById('audio-mute-btn').className='mute-btn'+(audioMuted?' muted':'');document.getElementById('audio-vol').value=audioMuted?0:100;document.getElementById('audio-vol-val').textContent=audioMuted?'0%':'100%';}
-  if(editingStreamId&&liveMap[editingStreamId]){clearTimeout(volDebounce);volDebounce=setTimeout(async()=>{await saveMetaNow();await fetch('/api/streams/'+editingStreamId+'/restart',{method:'POST'});},500);}
+async function watchHdAd() {
+  const btn=document.getElementById('hd-btn'); btn.textContent='⏳ Ad playing...'; btn.disabled=true;
+  await new Promise(r=>setTimeout(r,2000));
+  const res=await fetch('/watch-hd-ad',{method:'POST'});
+  if ((await res.json()).success) await fetchState();
+  else { btn.textContent='1080p for 24hrs — Watch 1 ad'; btn.disabled=false; }
 }
 
-async function saveMetaNow(){
-  if(!editingStreamId)return;
-  await fetch('/api/streams/'+editingStreamId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('stream-name').value.trim(),streamKey:document.getElementById('stream-key').value.trim(),resolution:document.getElementById('stream-res').value,videoVolume:parseInt(document.getElementById('video-vol').value),videoMuted,audioVolume:parseInt(document.getElementById('audio-vol').value),audioMuted})});
-}
-
-async function saveStream(){
-  const name=document.getElementById('stream-name').value.trim();
-  const key=document.getElementById('stream-key').value.trim();
-  const res=document.getElementById('stream-res').value;
-  const videoVol=parseInt(document.getElementById('video-vol').value);
-  const audioVol=parseInt(document.getElementById('audio-vol').value);
-  const errEl=document.getElementById('modal-error');const saveBtn=document.getElementById('save-btn');
-  if(!name){errEl.textContent='Please enter a stream name';errEl.style.display='block';return;}
-  saveBtn.disabled=true;saveBtn.textContent='Saving...';errEl.style.display='none';
-  const payload={name,streamKey:key,resolution:res,videoVolume:videoVol,videoMuted,audioVolume:audioVol,audioMuted};
-  if(editingStreamId){
-    const r=await fetch('/api/streams/'+editingStreamId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const data=await r.json();
-    if(data.error){errEl.textContent=data.error;errEl.style.display='block';saveBtn.disabled=false;saveBtn.textContent='Save changes';return;}
-    if(selectedVideoFile){saveBtn.textContent='Uploading video...';const fd=new FormData();fd.append('file',selectedVideoFile);await fetch('/api/streams/'+editingStreamId+'/upload-video',{method:'POST',body:fd});}
-    for(let i=0;i<audioFiles.length;i++){saveBtn.textContent='Uploading audio '+(i+1)+'/'+audioFiles.length+'...';const fd=new FormData();fd.append('file',audioFiles[i]);await fetch('/api/streams/'+editingStreamId+'/upload-audio',{method:'POST',body:fd});}
-    if(liveMap[editingStreamId]){saveBtn.textContent='Restarting stream...';await fetch('/api/streams/'+editingStreamId+'/restart',{method:'POST'});}
-    closeModal();location.reload();return;
+function updateBadges() {
+  if (!state) return;
+  const wmBadge=document.getElementById('wm-badge'), wmText=document.getElementById('wm-text'), wmBtn=document.getElementById('wm-btn');
+  const hdBadge=document.getElementById('hd-badge'), hdText=document.getElementById('hd-text'), hdBtn=document.getElementById('hd-btn');
+  if (state.watermarkActive) {
+    wmBadge.className='badge wm-active'; wmText.textContent='⚠️ Watermark active'; wmBtn.style.display=''; wmBtn.textContent='Watch 1 ad to remove'; wmBtn.disabled=false;
+  } else {
+    const h=Math.floor(state.watermarkSecsLeft/3600), m=Math.floor((state.watermarkSecsLeft%3600)/60);
+    wmBadge.className='badge wm-removed'; wmText.textContent='✓ No watermark — '+(h>0?h+'h ':'')+m+'m left'; wmBtn.style.display='none';
   }
-  const r=await fetch('/api/streams',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  const data=await r.json();
-  if(data.error){errEl.textContent=data.error;errEl.style.display='block';saveBtn.disabled=false;saveBtn.textContent='Save stream';return;}
-  const sid=data.id;document.getElementById('upload-progress').style.display='block';
-  if(selectedVideoFile){saveBtn.textContent='Uploading video...';await uploadXHR('/api/streams/'+sid+'/upload-video',selectedVideoFile);}
-  for(let i=0;i<audioFiles.length;i++){saveBtn.textContent='Uploading audio '+(i+1)+'/'+audioFiles.length+'...';await uploadXHR('/api/streams/'+sid+'/upload-audio',audioFiles[i]);}
-  closeModal();location.reload();
+  if (state.hdActive) {
+    hdBadge.className='badge hd-active'; hdText.textContent='📺 720p — Free'; hdBtn.textContent='1080p for 24hrs — Watch 1 ad'; hdBtn.disabled=false; hdBtn.style.display='';
+  } else {
+    const h=Math.floor(state.hdSecsLeft/3600), m=Math.floor((state.hdSecsLeft%3600)/60);
+    hdBadge.className='badge hd-unlocked'; hdText.textContent='🎬 1080p unlocked — '+(h>0?h+'h ':'')+m+'m left'; hdBtn.style.display='none';
+  }
 }
 
-function uploadXHR(url,file){return new Promise(resolve=>{const fd=new FormData();fd.append('file',file);const xhr=new XMLHttpRequest();xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);document.getElementById('progress-fill').style.width=p+'%';document.getElementById('progress-label').textContent='Uploading '+p+'%...';}};xhr.onload=xhr.onerror=()=>resolve();xhr.open('POST',url);xhr.send(fd);});}
+function openAdModal() { document.getElementById('ad-modal').classList.add('open'); renderAdContent(); }
+function closeAdModal() { document.getElementById('ad-modal').classList.remove('open'); }
 
-async function startStream(id){const btn=document.querySelector('#stream-'+id+' .btn-start');if(btn){btn.textContent='⏳ Starting...';btn.disabled=true;}const res=await fetch('/api/streams/'+id+'/start',{method:'POST'});const data=await res.json();if(data.error){alert(data.error);location.reload();return;}location.reload();}
-async function stopStream(id){await fetch('/api/streams/'+id+'/stop',{method:'POST'});location.reload();}
-async function deleteStream(id){if(!confirm('Delete this stream? This cannot be undone.'))return;await fetch('/api/streams/'+id,{method:'DELETE'});location.reload();}
+function renderDots() {
+  if (!state) return;
+  const c=document.getElementById('streak-dots'); c.innerHTML='';
+  for (let i=1;i<=6;i++) { const d=document.createElement('div'); d.className='streak-dot'+(i<state.currentStreak?' done':i===state.currentStreak?' active':''); d.textContent=i; c.appendChild(d); }
+}
+
+function renderAdContent() {
+  if (!state) return;
+  renderDots();
+  const content=document.getElementById('ad-content');
+  if (state.batchesUsed) { content.innerHTML='<div class="daily-box"><div style="font-size:22px;margin-bottom:8px;">✅ All done for today!</div><div style="font-size:15px;">Come back tomorrow for 25 free credits + 12 more ad slots.</div></div><button class="modal-btn btn-secondary" onclick="closeAdModal()">Close</button>'; return; }
+  if (state.inCooldown) { content.innerHTML='<div class="cooldown-box"><div>⏳ Cooldown active</div><div class="cooldown-timer" id="countdown"></div><div>Next batch available soon</div></div><button class="modal-btn btn-secondary" onclick="closeAdModal()">Close</button>'; startCountdown(state.cooldownSecsLeft); return; }
+  if (state.currentStreak===0) {
+    content.innerHTML=\`<div class="offer-box"><div class="amount">+10</div><div class="label">credits for watching 1 ad</div></div><button class="modal-btn btn-watch" onclick="watchAd()">▶ Watch Ad — get 10 credits</button><div class="slots-info">\${state.adsRemainingInBatch} ad slots remaining today</div>\`;
+  } else {
+    const cur=TIERS[state.currentStreak], next=TIERS[state.currentStreak+1], canContinue=state.currentStreak<6&&state.adsRemainingInBatch>0;
+    content.innerHTML=\`<div class="offer-box"><div class="amount">+\${cur}</div><div class="label">credits ready to collect</div></div><button class="modal-btn btn-collect" onclick="collect()">✅ Collect \${cur} credits</button>\${canContinue?\`<button class="modal-btn btn-watch" onclick="watchAd()">🎰 One more → +\${next} total</button>\`:''}<button class="modal-btn btn-secondary" onclick="closeAdModal()">Maybe later</button>\`;
+  }
+}
+
+async function watchAd() {
+  document.getElementById('ad-content').innerHTML='<div style="text-align:center;padding:2.5rem;color:#555;font-size:15px;">⏳ Ad playing...<br><br><span style="font-size:13px;">Please wait</span></div>';
+  await new Promise(r=>setTimeout(r,2000));
+  const res=await fetch('/watch-ad',{method:'POST'}); const data=await res.json();
+  if (data.error){alert(data.error);await fetchState();renderAdContent();return;}
+  if (data.isMaxStreak) launchConfetti();
+  await fetchState(); renderAdContent();
+}
+async function collect() {
+  const res=await fetch('/collect',{method:'POST'}); const data=await res.json();
+  if (data.error){alert(data.error);return;}
+  if (data.isJackpot) launchConfetti();
+  await fetchState(); renderAdContent(); updateCreditCost();
+}
+function startCountdown(secs) {
+  let r=secs;
+  const tick=()=>{ const el=document.getElementById('countdown'); if(!el)return; el.textContent=Math.floor(r/60)+':'+String(r%60).padStart(2,'0'); if(r<=0){fetchState().then(renderAdContent);return;} r--; setTimeout(tick,1000); };
+  tick();
+}
+function launchConfetti() {
+  const c=document.getElementById('confetti-container');
+  for(let i=0;i<100;i++){const p=document.createElement('div');p.className='confetti-piece';p.style.cssText=\`left:\${Math.random()*100}vw;background:\${COLORS[Math.floor(Math.random()*COLORS.length)]};animation-delay:\${Math.random()*1.5}s;width:\${Math.random()*8+5}px;height:\${Math.random()*8+5}px\`;c.appendChild(p);setTimeout(()=>p.remove(),4000);}
+}
+
+async function fetchState() {
+  const res=await fetch('/state');
+  if (res.redirected||res.status===401){window.location.href='/login';return;}
+  state=await res.json();
+  document.getElementById('credits-display').textContent=state.credits;
+  if (state.avatar) document.getElementById('user-avatar').src=state.avatar;
+  updateBadges(); updateCreditCost();
+}
+
+async function cancelExport() {
+  const res = await fetch('/cancel-export', {method:'POST'});
+  const data = await res.json();
+  document.getElementById('export-msg').textContent = '✕ Export cancelled — credits were not refunded';
+  document.getElementById('export-progress').style.width = '0%';
+  document.getElementById('cancel-btn').style.display = 'none';
+  document.getElementById('go-btn').disabled = false;
+  isExporting = false;
+  await fetchState();
+}
+
+async function startExport() {
+  if (!document.getElementById('img-input').files[0]) { alert('Please select a background image'); return; }
+  if (audioFiles.length===0) { alert('Please add at least one audio track'); return; }
+  const secs=parseDur(document.getElementById('dur-input').value);
+  const total=getCreditsForSecs(secs)+(fadeInActive?5:0)+(fadeOutActive?5:0);
+  if (!state||state.credits<total){openAdModal();return;}
+
+  const btn=document.getElementById('go-btn');
+  const cancelBtn=document.getElementById('cancel-btn');
+  const status=document.getElementById('export-status');
+  const msg=document.getElementById('export-msg');
+  const progress=document.getElementById('export-progress');
+  const resultBox=document.getElementById('result-box');
+  const errorBox=document.getElementById('error-box');
+
+  btn.disabled=true;
+  cancelBtn.style.display='block';
+  status.classList.add('active');
+  resultBox.style.display='none';
+  errorBox.style.display='none';
+  isExporting=true;
+  msg.textContent='Uploading files to server...';
+  progress.style.width='8%';
+
+  const formData=new FormData();
+  formData.append('image',document.getElementById('img-input').files[0]);
+  audioFiles.forEach(f=>formData.append('audio',f));
+  formData.append('durationSeconds',secs);
+  formData.append('fps',isImageFile?1:(document.getElementById('fps-input').value||1));
+  formData.append('repeatCount',document.getElementById('loop-input').value||1);
+  formData.append('fadeIn',fadeInActive);
+  formData.append('fadeOut',fadeOutActive);
+  formData.append('fitMode',fitMode);
+  formData.append('fileName', document.getElementById('yt-title-preview').textContent || 'loopmixvideo');
+
+  msg.textContent='Encoding video — this may take a few minutes...';
+  progress.style.width='20%';
+  let prog=20;
+  const iv=setInterval(()=>{if(prog<85){prog++;progress.style.width=prog+'%';}},5000);
+
+  try {
+    const res=await fetch('/export',{method:'POST',body:formData});
+    clearInterval(iv);
+    if (!res.ok) {
+      const e=await res.json();
+      throw new Error(e.error||'Export failed');
+    }
+    progress.style.width='95%';
+    msg.textContent='✓ Done! Downloading your video...';
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download=(document.getElementById('yt-title-preview').textContent||'loopmixvideo')+'.mp4';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    progress.style.width='100%';
+    msg.textContent='✓ Complete!';
+    resultBox.innerHTML='✓ Video downloaded! File will be deleted from our servers within 30 seconds.';
+    resultBox.style.display='block';
+    await fetchState();
+  } catch(e) {
+    clearInterval(iv);
+    if (e.message !== 'Export was cancelled') {
+      document.getElementById('error-msg').textContent='Error: '+e.message;
+      errorBox.style.display='block';
+    }
+    msg.textContent='Failed';
+    progress.style.width='0%';
+  } finally {
+    btn.disabled=false;
+    cancelBtn.style.display='none';
+    isExporting=false;
+  }
+}
+
+fetchState();
+setInterval(fetchState,30000);
+window.addEventListener('resize',drawPreview);
 </script>
 </body>
 </html>`);
 });
 
-app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/'); });
-
-// ==================== API ====================
-
-app.post('/api/register', async (req, res) => {
-  try {
-    const { email, password, plan } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    const existing = await pool.query('SELECT id FROM users WHERE email=$1', [email.toLowerCase().trim()]);
-    if (existing.rows.length > 0) return res.status(400).json({ error: 'Email already registered' });
-    const hashed = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      'INSERT INTO users (email,password,plan,stream_slots) VALUES ($1,$2,$3,$4) RETURNING id',
-      [email.toLowerCase().trim(), hashed, 'free', 0]
-    );
-    req.session.userId = result.rows[0].id;
-    res.json({ success: true });
-  } catch (e) { console.error('Register error:', e); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
-});
-
-app.post('/api/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    const result = await pool.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase().trim()]);
-    if (result.rows.length === 0) return res.status(400).json({ error: 'Invalid email or password' });
-    const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(400).json({ error: 'Invalid email or password' });
-    req.session.userId = user.id;
-    res.json({ success: true });
-  } catch (e) { console.error('Login error:', e); res.status(500).json({ error: 'Login failed. Please try again.' }); }
-});
-
-app.post('/api/create-subscription', requireAuthApi, async (req, res) => {
-  try {
-    const { plan } = req.body;
-    const planData = PLANS[plan];
-    if (!planData) return res.status(400).json({ error: 'Invalid plan' });
-    if (!planData.priceId) return res.status(400).json({ error: 'Plan not configured yet. Please contact support.' });
-
-    const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
-
-    // Create or get Stripe customer
-    let customerId = user.stripe_customer_id;
-    if (!customerId) {
-      const customer = await stripe.customers.create({ email: user.email });
-      customerId = customer.id;
-      await pool.query('UPDATE users SET stripe_customer_id=$1 WHERE id=$2', [customerId, user.id]);
-    }
-
-    // Create subscription with payment intent
-    const subscription = await stripe.subscriptions.create({
-      customer: customerId,
-      items: [{ price: planData.priceId }],
-      payment_behavior: 'default_incomplete',
-      expand: ['latest_invoice.payment_intent'],
-    });
-
-    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
-    await pool.query('UPDATE users SET stripe_subscription_id=$1 WHERE id=$2', [subscription.id, user.id]);
-
-    res.json({ clientSecret, subscriptionId: subscription.id });
-  } catch (e) { console.error('Subscription error:', e); res.status(500).json({ error: e.message }); }
-});
-
-// Stripe webhook
-app.post('/webhook', async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
-  } catch (e) {
-    // If no webhook secret, just parse the body
-    try { event = JSON.parse(req.body); } catch(e2) { return res.status(400).send('Webhook error'); }
-  }
-
-  if (event.type === 'invoice.payment_succeeded') {
-    const invoice = event.data.object;
-    const subscriptionId = invoice.subscription;
-    if (subscriptionId) {
-      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-      const priceId = subscription.items.data[0]?.price?.id;
-      const plan = Object.entries(PLANS).find(([,p]) => p.priceId === priceId)?.[0] || 'pro';
-      const planSlots = { starter:1, pro:1, creator:3, studio:6 };
-      await pool.query(
-        'UPDATE users SET plan=$1, stream_slots=$2, subscription_status=$3 WHERE stripe_subscription_id=$4',
-        [plan, planSlots[plan]||1, 'active', subscriptionId]
-      );
-    }
-  }
-
-  if (event.type === 'customer.subscription.deleted') {
-    const subscription = event.data.object;
-    await pool.query(
-      'UPDATE users SET plan=$1, stream_slots=$2, subscription_status=$3 WHERE stripe_subscription_id=$4',
-      ['free', 0, 'cancelled', subscription.id]
-    );
-  }
-
-  res.json({ received: true });
-});
-
-app.post('/api/streams', requireAuthApi, async (req, res) => {
-  try {
-    const { name, streamKey, resolution, videoVolume, videoMuted, audioVolume, audioMuted } = req.body;
-    const user = (await pool.query('SELECT * FROM users WHERE id=$1', [req.session.userId])).rows[0];
-    const count = parseInt((await pool.query('SELECT COUNT(*) FROM streams WHERE user_id=$1', [req.session.userId])).rows[0].count);
-    if (count >= user.stream_slots) return res.status(400).json({ error: 'Stream slot limit reached. Upgrade your plan.' });
-    const result = await pool.query(
-      'INSERT INTO streams (user_id,name,stream_key,resolution,video_volume,video_muted,audio_volume,audio_muted) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [req.session.userId, name||'My Stream', streamKey||null, resolution||'1080p', videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false]
-    );
-    res.json(result.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/api/streams/:id', requireAuthApi, async (req, res) => {
-  try {
-    const { name, streamKey, resolution, videoVolume, videoMuted, audioVolume, audioMuted } = req.body;
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    await pool.query('UPDATE streams SET name=$1,stream_key=$2,resolution=$3,video_volume=$4,video_muted=$5,audio_volume=$6,audio_muted=$7 WHERE id=$8',
-      [name, streamKey||null, resolution, videoVolume||100, videoMuted||false, audioVolume||100, audioMuted||false, req.params.id]);
-    const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/streams/:id/upload-video', requireAuthApi, upload.single('file'), async (req, res) => {
-  try {
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    if (stream.file_path && fs.existsSync(stream.file_path)) { try { fs.unlinkSync(stream.file_path); } catch(e) {} }
-    if (stream.thumb_path) { const tp = path.join(THUMB_DIR, path.basename(stream.thumb_path)); if (fs.existsSync(tp)) { try { fs.unlinkSync(tp); } catch(e) {} } }
-    const thumbPath = await generateThumb(req.file.path, req.params.id);
-    await pool.query('UPDATE streams SET file_path=$1,file_name=$2,thumb_path=$3 WHERE id=$4', [req.file.path, req.file.originalname, thumbPath, req.params.id]);
-    const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
-    res.json({ success: true, thumb_path: thumbPath });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/streams/:id/upload-audio', requireAuthApi, upload.single('file'), async (req, res) => {
-  try {
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    const tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
-    tracks.push({ path: req.file.path, name: req.file.originalname });
-    await pool.query('UPDATE streams SET audio_tracks=$1 WHERE id=$2', [JSON.stringify(tracks), req.params.id]);
-    const active = activeStreams.get(parseInt(req.params.id));
-    if (active) { const updated = (await pool.query('SELECT * FROM streams WHERE id=$1', [req.params.id])).rows[0]; active.streamData = { ...active.streamData, ...updated }; }
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/streams/:id/start', requireAuthApi, async (req, res) => {
-  try {
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    if (!stream.file_path || !fs.existsSync(stream.file_path)) return res.status(400).json({ error: 'No video/image file uploaded' });
-    if (!stream.stream_key) return res.status(400).json({ error: 'No stream key set' });
-    startFFmpeg(stream.id, stream);
-    await pool.query('UPDATE streams SET status=$1 WHERE id=$2', ['live', stream.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/streams/:id/stop', requireAuthApi, async (req, res) => {
-  try {
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    const entry = activeStreams.get(stream.id);
-    if (entry) { entry.restarting = true; try { entry.proc.kill('SIGKILL'); } catch(e) {} activeStreams.delete(stream.id); }
-    await pool.query('UPDATE streams SET status=$1 WHERE id=$2', ['stopped', stream.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/streams/:id/restart', requireAuthApi, async (req, res) => {
-  try {
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    if (!activeStreams.has(stream.id)) return res.json({ success: false });
-    startFFmpeg(stream.id, stream);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/api/streams/:id', requireAuthApi, async (req, res) => {
-  try {
-    const stream = (await pool.query('SELECT * FROM streams WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId])).rows[0];
-    if (!stream) return res.status(404).json({ error: 'Stream not found' });
-    const entry = activeStreams.get(stream.id);
-    if (entry) { entry.restarting = true; try { entry.proc.kill('SIGKILL'); } catch(e) {} activeStreams.delete(stream.id); }
-    if (stream.file_path && fs.existsSync(stream.file_path)) { try { fs.unlinkSync(stream.file_path); } catch(e) {} }
-    if (stream.thumb_path) { const tp = path.join(THUMB_DIR, path.basename(stream.thumb_path)); if (fs.existsSync(tp)) { try { fs.unlinkSync(tp); } catch(e) {} } }
-    const tracks = Array.isArray(stream.audio_tracks) ? stream.audio_tracks : [];
-    for (const t of tracks) { if (t.path && fs.existsSync(t.path)) { try { fs.unlinkSync(t.path); } catch(e) {} } }
-    await pool.query('DELETE FROM streams WHERE id=$1', [req.params.id]);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('StreamForCheap running on port ' + PORT));
+app.listen(PORT, () => console.log('Running on port ' + PORT));
